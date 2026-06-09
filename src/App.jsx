@@ -1,0 +1,1476 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const COINS = ["BTC", "ETH", "SOL"];
+const COIN_COLORS = { BTC: "#f59e0b", ETH: "#6366f1", SOL: "#10b981" };
+// Fallback baselines — used only if proxy is unreachable
+const COIN_BASE = { BTC: 63000, ETH: 3000, SOL: 145 };
+const PRODUCT_IDS = { BTC: "BTC-USD", ETH: "ETH-USD", SOL: "SOL-USD" };
+
+// ─── Proxy config ─────────────────────────────────────────────────────────────
+// After deploying coinbase-cors-proxy to Vercel, paste your deployment URL here.
+// e.g. "https://coinbase-cors-proxy.vercel.app"
+// Leave as empty string to stay in simulation-only mode.
+const PROXY_BASE = "https://coinbaseticker-283150216453.europe-west1.run.app";
+
+// ─── Public price fetch via proxy, with full diagnostics ──────────────────────
+// Returns { price, ok, httpStatus, errorType, errorMsg, raw }
+// errorType: "no_proxy" | "cors" | "network" | "http" | "parse" | "empty" | null
+async function fetchPublicPriceDiag(productId) {
+  const diag = { price: null, ok: false, httpStatus: null, errorType: null, errorMsg: null, raw: null };
+
+  if (!PROXY_BASE) {
+    diag.errorType = "no_proxy";
+    diag.errorMsg = "No proxy URL configured — set PROXY_BASE in the source to your Vercel deployment.";
+    return diag;
+  }
+
+  const url = `${PROXY_BASE}?product=${productId}`;
+
+  try {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    diag.httpStatus = res.status;
+
+    if (!res.ok) {
+      diag.errorType = "http";
+      diag.errorMsg = `Proxy returned HTTP ${res.status} ${res.statusText}`;
+      return diag;
+    }
+
+    let payload;
+    try {
+      const text = await res.text();
+      diag.raw = text.slice(0, 300);
+      payload = JSON.parse(text);
+    } catch (e) {
+      diag.errorType = "parse";
+      diag.errorMsg = `JSON parse failed: ${e.message}`;
+      return diag;
+    }
+
+    // Proxy returns { data: { BTC: { price, bid, ask, ... } }, fetchedAt }
+    const symbol = productId.replace("-USD", "");
+    const coinData = payload?.data?.[symbol];
+    const price = parseFloat(coinData?.price);
+
+    if (!coinData || isNaN(price)) {
+      diag.errorType = "empty";
+      diag.errorMsg = payload?.errors?.[symbol]
+        || `No price for ${symbol}. Proxy keys: ${Object.keys(payload?.data || {}).join(", ")}`;
+      return diag;
+    }
+
+    diag.price = price;
+    diag.bid = parseFloat(coinData.bid) || null;
+    diag.ask = parseFloat(coinData.ask) || null;
+    diag.volume = parseFloat(coinData.volume) || null;
+    diag.ok = true;
+    return diag;
+
+  } catch (e) {
+    const msg = e.message || String(e);
+    diag.errorType = msg.toLowerCase().includes("cors") || msg.toLowerCase().includes("failed to fetch")
+      ? "cors" : "network";
+    diag.errorMsg = msg;
+    return diag;
+  }
+}
+
+// Batch fetch all coins via a single proxy call, return { prices, diags }
+async function fetchAllPublicPrices() {
+  if (!PROXY_BASE) {
+    const diags = {};
+    for (const coin of COINS) {
+      diags[coin] = {
+        price: null, ok: false, httpStatus: null,
+        errorType: "no_proxy",
+        errorMsg: "No proxy URL configured — set PROXY_BASE in the source to your Cloud Run function URL.",
+        raw: null,
+      };
+    }
+    return { prices: {}, diags };
+  }
+
+  // Single batched request: ?product=BTC-USD,ETH-USD,SOL-USD
+  const productList = COINS.map((c) => PRODUCT_IDS[c]).join(",");
+  const url = `${PROXY_BASE}?product=${productList}`;
+  const diags = {};
+  const prices = {};
+
+  try {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    const text = await res.text();
+
+    if (!res.ok) {
+      for (const coin of COINS) {
+        diags[coin] = { price: null, ok: false, httpStatus: res.status, errorType: "http",
+          errorMsg: `Proxy HTTP ${res.status}`, raw: text.slice(0, 200) };
+      }
+      return { prices, diags };
+    }
+
+    const payload = JSON.parse(text);
+
+    for (const coin of COINS) {
+      const coinData = payload?.data?.[coin];
+      const price = parseFloat(coinData?.price);
+      if (!coinData || isNaN(price)) {
+        diags[coin] = {
+          price: null, ok: false, httpStatus: res.status, errorType: "empty",
+          errorMsg: payload?.errors?.[coin] || `${coin} missing from proxy response`,
+          raw: text.slice(0, 200),
+        };
+      } else {
+        prices[coin] = price;
+        diags[coin] = {
+          price, ok: true, httpStatus: res.status, errorType: null, errorMsg: null,
+          bid: parseFloat(coinData.bid) || null,
+          ask: parseFloat(coinData.ask) || null,
+          volume: parseFloat(coinData.volume) || null,
+        };
+      }
+    }
+  } catch (e) {
+    const msg = e.message || String(e);
+    const errorType = msg.toLowerCase().includes("cors") || msg.toLowerCase().includes("failed to fetch")
+      ? "cors" : "network";
+    for (const coin of COINS) {
+      diags[coin] = { price: null, ok: false, httpStatus: null, errorType, errorMsg: msg, raw: null };
+    }
+  }
+
+  return { prices, diags };
+}
+const CB_API_BASE = "https://api.coinbase.com/api/v3/brokerage";
+
+// Real news fetched from NewsData.io via the Cloud Run proxy
+const NEWS_PROXY_URL = `${PROXY_BASE}/news`;
+
+// ─── Technical Indicators ─────────────────────────────────────────────────────
+function generatePrice(prev, volatility = 0.0015) {
+  const change = (Math.random() - 0.499) * volatility * prev;
+  return Math.max(prev + change, prev * 0.97);
+}
+function calcSMA(prices, period) {
+  if (prices.length < period) return null;
+  return prices.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+function calcRSI(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  const changes = prices.slice(-period - 1).map((p, i, arr) => (i > 0 ? p - arr[i - 1] : 0)).slice(1);
+  const gains = changes.filter((c) => c > 0);
+  const losses = changes.filter((c) => c < 0).map(Math.abs);
+  const avgGain = gains.length ? gains.reduce((a, b) => a + b, 0) / period : 0;
+  const avgLoss = losses.length ? losses.reduce((a, b) => a + b, 0) / period : 0;
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+function calcBollinger(prices, period = 20) {
+  if (prices.length < period) return null;
+  const slice = prices.slice(-period);
+  const mean = slice.reduce((a, b) => a + b, 0) / period;
+  const std = Math.sqrt(slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period);
+  return { upper: mean + 2 * std, middle: mean, lower: mean - 2 * std };
+}
+function calcMACD(prices) {
+  const e12 = calcEMA(prices, 12), e26 = calcEMA(prices, 26);
+  return e12 && e26 ? e12 - e26 : null;
+}
+function generateSignal(indicators, newsSentiment, volumeRatio) {
+  let score = 0;
+  const reasons = [];
+  if (indicators.rsi !== null) {
+    if (indicators.rsi < 35) { score += 2; reasons.push(`RSI oversold (${indicators.rsi.toFixed(1)})`); }
+    else if (indicators.rsi > 65) { score -= 2; reasons.push(`RSI overbought (${indicators.rsi.toFixed(1)})`); }
+    else reasons.push(`RSI neutral (${indicators.rsi.toFixed(1)})`);
+  }
+  if (indicators.sma20 && indicators.sma50) {
+    if (indicators.sma20 > indicators.sma50) { score += 1.5; reasons.push("SMA20 > SMA50 (bullish cross)"); }
+    else { score -= 1.5; reasons.push("SMA20 < SMA50 (bearish cross)"); }
+  }
+  if (indicators.macd !== null) {
+    if (indicators.macd > 0) { score += 1; reasons.push(`MACD positive (${indicators.macd.toFixed(2)})`); }
+    else { score -= 1; reasons.push(`MACD negative (${indicators.macd.toFixed(2)})`); }
+  }
+  if (indicators.boll && indicators.currentPrice) {
+    if (indicators.currentPrice < indicators.boll.lower) { score += 2; reasons.push("Price below BB lower band"); }
+    else if (indicators.currentPrice > indicators.boll.upper) { score -= 2; reasons.push("Price above BB upper band"); }
+  }
+  if (newsSentiment > 0.5) { score += 1.5; reasons.push(`Positive news (${(newsSentiment * 100).toFixed(0)}%)`); }
+  else if (newsSentiment < -0.3) { score -= 1.5; reasons.push(`Negative news (${(newsSentiment * 100).toFixed(0)}%)`); }
+  if (volumeRatio > 1.4) { score += Math.sign(score) * 1; reasons.push(`High volume (${volumeRatio.toFixed(2)}x avg)`); }
+  else if (volumeRatio < 0.7) { score *= 0.7; reasons.push(`Low volume (${volumeRatio.toFixed(2)}x avg)`); }
+  const action = score > 2 ? "BUY" : score < -2 ? "SELL" : "HOLD";
+  const confidence = Math.min(Math.abs(score) / 8 * 100, 97);
+  return { action, score: score.toFixed(2), confidence: confidence.toFixed(1), reasons };
+}
+
+// ─── Rate Limiter + Exponential Backoff ───────────────────────────────────────
+// Coinbase Advanced Trade limits: READ 600 req/10s, WRITE 500 req/10s.
+// We track timestamps of recent calls in a sliding 10-second window.
+// On 429 / 5xx we apply full exponential backoff with jitter (capped at 32s).
+
+const RATE_LIMITS = { READ: { max: 600, windowMs: 10_000 }, WRITE: { max: 500, windowMs: 10_000 } };
+const MAX_RETRIES = 6;
+const BASE_DELAY_MS = 250;   // first backoff step
+const MAX_BACKOFF_MS = 32_000;
+
+// Shared mutable state for rate-limit windows (module-level, not React state)
+const _rl = {
+  READ:  { timestamps: [] },
+  WRITE: { timestamps: [] },
+  // Observable counters — React components read these via a ref + polling
+  stats: { readUsed: 0, writeUsed: 0, readQueued: 0, writeQueued: 0, retries: 0, throttled: 0, lastError: null },
+};
+
+function _pruneWindow(bucket) {
+  const cutoff = Date.now() - RATE_LIMITS[bucket].windowMs;
+  _rl[bucket].timestamps = _rl[bucket].timestamps.filter((t) => t > cutoff);
+}
+
+function _windowUsed(bucket) {
+  _pruneWindow(bucket);
+  return _rl[bucket].timestamps.length;
+}
+
+// Returns ms to wait before the next slot opens (0 = fire now)
+function _waitMs(bucket) {
+  _pruneWindow(bucket);
+  const { timestamps } = _rl[bucket];
+  const { max, windowMs } = RATE_LIMITS[bucket];
+  if (timestamps.length < max) return 0;
+  // Oldest timestamp in window — waiting until it expires opens a slot
+  const oldest = timestamps[0];
+  return Math.max(0, oldest + windowMs - Date.now() + 5); // +5ms safety margin
+}
+
+function _recordCall(bucket) {
+  _rl[bucket].timestamps.push(Date.now());
+}
+
+function _sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Exponential backoff with full jitter: delay = rand(0, min(cap, base * 2^attempt))
+function _backoffMs(attempt) {
+  const exp = Math.min(MAX_BACKOFF_MS, BASE_DELAY_MS * Math.pow(2, attempt));
+  return Math.floor(Math.random() * exp);
+}
+
+// ─── CDP JWT Auth ─────────────────────────────────────────────────────────────
+async function importCBKey(pemPrivate) {
+  const b64 = pemPrivate.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey("pkcs8", der, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+}
+async function buildCBJWT(apiKeyName, privateKeyPem, method, path) {
+  const now = Math.floor(Date.now() / 1000);
+  const uri = `${method} api.coinbase.com${path}`;
+  const header = { alg: "ES256", kid: apiKeyName };
+  const payload = { iss: "cdp", nbf: now, exp: now + 120, sub: apiKeyName, uri };
+  const enc = (obj) => btoa(JSON.stringify(obj)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const signing = `${enc(header)}.${enc(payload)}`;
+  const key = await importCBKey(privateKeyPem);
+  const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(signing));
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${signing}.${sigB64}`;
+}
+
+// ─── Core rate-limited fetch with exponential backoff ────────────────────────
+// bucket: "READ" | "WRITE"
+async function cbFetch(creds, method, path, body, _attempt = 0) {
+  const bucket = method === "GET" ? "READ" : "WRITE";
+
+  // 1. Rate-limit gate — wait until a slot opens
+  const wait = _waitMs(bucket);
+  if (wait > 0) {
+    _rl.stats.throttled++;
+    _rl.stats[bucket === "READ" ? "readQueued" : "writeQueued"]++;
+    await _sleep(wait);
+    _rl.stats[bucket === "READ" ? "readQueued" : "writeQueued"]--;
+  }
+
+  // 2. Record the call and build JWT
+  _recordCall(bucket);
+  _rl.stats[bucket === "READ" ? "readUsed" : "writeUsed"] = _windowUsed(bucket);
+
+  const jwt = await buildCBJWT(creds.apiKeyName, creds.privateKey, method, path);
+
+  // 3. Fire the request
+  let res, data;
+  try {
+    res = await fetch(`${CB_API_BASE}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    data = await res.json();
+  } catch (networkErr) {
+    // Network-level failure — retry with backoff
+    if (_attempt < MAX_RETRIES) {
+      const delay = _backoffMs(_attempt);
+      _rl.stats.retries++;
+      _rl.stats.lastError = `Network error, retry ${_attempt + 1} in ${delay}ms`;
+      await _sleep(delay);
+      return cbFetch(creds, method, path, body, _attempt + 1);
+    }
+    throw networkErr;
+  }
+
+  // 4. Handle HTTP errors
+  if (res.status === 429) {
+    // Respect Retry-After header if present, otherwise use backoff
+    const retryAfter = parseInt(res.headers?.get?.("Retry-After") || "0", 10);
+    const delay = retryAfter > 0 ? retryAfter * 1000 : _backoffMs(_attempt);
+    if (_attempt < MAX_RETRIES) {
+      _rl.stats.retries++;
+      _rl.stats.lastError = `429 rate limited, retry ${_attempt + 1} in ${Math.round(delay / 1000)}s`;
+      await _sleep(delay);
+      return cbFetch(creds, method, path, body, _attempt + 1);
+    }
+    throw new Error("Rate limit exceeded after max retries");
+  }
+
+  if (res.status >= 500 && _attempt < MAX_RETRIES) {
+    const delay = _backoffMs(_attempt);
+    _rl.stats.retries++;
+    _rl.stats.lastError = `HTTP ${res.status}, retry ${_attempt + 1} in ${delay}ms`;
+    await _sleep(delay);
+    return cbFetch(creds, method, path, body, _attempt + 1);
+  }
+
+  if (!res.ok) {
+    const msg = data?.message || data?.error || data?.preview_failure_reason || `HTTP ${res.status}`;
+    _rl.stats.lastError = msg;
+    throw new Error(msg);
+  }
+
+  _rl.stats.lastError = null;
+  return data;
+}
+
+// ─── High-level API calls ────────────────────────────────────────────────────
+async function cbGetPrice(creds, productId) {
+  const data = await cbFetch(creds, "GET", `/best_bid_ask?product_ids=${productId}`);
+  const entry = data.pricebooks?.[0];
+  if (!entry) throw new Error("No price data");
+  return parseFloat(entry.asks?.[0]?.price || entry.bids?.[0]?.price);
+}
+async function cbGetAccounts(creds) {
+  // Single call fetches all accounts — avoids duplicate GET /accounts per currency
+  return cbFetch(creds, "GET", "/accounts");
+}
+async function cbGetCandles(creds, productId, granularity = "ONE_MINUTE") {
+  const end = Math.floor(Date.now() / 1000);
+  const start = end - 60 * 60; // last 60 minutes
+  return cbFetch(creds, "GET", `/products/${productId}/candles?start=${start}&end=${end}&granularity=${granularity}`);
+}
+async function cbGetOrderBook(creds, productId) {
+  return cbFetch(creds, "GET", `/product_book?product_id=${productId}&limit=5`);
+}
+async function cbPlaceOrder(creds, productId, side, quoteSize, baseSize) {
+  const clientOrderId = `algo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const orderConfig = side === "BUY"
+    ? { market_market_ioc: { quote_size: quoteSize.toFixed(2) } }
+    : { market_market_ioc: { base_size: baseSize.toFixed(8) } };
+  return cbFetch(creds, "POST", "/orders", {
+    client_order_id: clientOrderId,
+    product_id: productId,
+    side,
+    order_configuration: orderConfig,
+  });
+}
+async function cbGetFills(creds, productId) {
+  return cbFetch(creds, "GET", `/orders/historical/fills?product_id=${productId}&limit=10`);
+}
+
+// ─── Helper: snapshot current rate-limit stats (for React display) ────────────
+function getRateLimitStats() {
+  return {
+    readUsed: _windowUsed("READ"),
+    readMax: RATE_LIMITS.READ.max,
+    writeUsed: _windowUsed("WRITE"),
+    writeMax: RATE_LIMITS.WRITE.max,
+    readQueued: _rl.stats.readQueued,
+    writeQueued: _rl.stats.writeQueued,
+    retries: _rl.stats.retries,
+    throttled: _rl.stats.throttled,
+    lastError: _rl.stats.lastError,
+  };
+}
+
+// ─── Utility formatters ────────────────────────────────────────────────────────
+const fmt = (n, d = 2) => n?.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) ?? "—";
+const fmtPct = (n) => (n >= 0 ? "+" : "") + n?.toFixed(2) + "%";
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+function Badge({ action }) {
+  const styles = {
+    BUY: { background: "#d1fae5", color: "#065f46" },
+    SELL: { background: "#fee2e2", color: "#991b1b" },
+    HOLD: { background: "#fef3c7", color: "#92400e" },
+  };
+  return (
+    <span style={{ ...styles[action], padding: "2px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600, letterSpacing: 0.5 }}>
+      {action}
+    </span>
+  );
+}
+
+function MiniChart({ data }) {
+  if (data.length < 2) return null;
+  const prices = data.map((d) => d.price);
+  const min = Math.min(...prices), max = Math.max(...prices);
+  const range = max - min || 1;
+  const w = 100, h = 32, pad = 2;
+  const pts = prices.map((p, i) => {
+    const x = pad + (i / (prices.length - 1)) * (w - pad * 2);
+    const y = h - pad - ((p - min) / range) * (h - pad * 2);
+    return `${x},${y}`;
+  });
+  const up = prices[prices.length - 1] >= prices[0];
+  const polyline = pts.join(" ");
+  const area = `${pad},${h - pad} ${polyline} ${w - pad},${h - pad}`;
+  return (
+    <svg width={w} height={h}>
+      <polygon points={area} fill={up ? "#d1fae5" : "#fee2e2"} opacity={0.5} />
+      <polyline points={polyline} fill="none" stroke={up ? "#10b981" : "#ef4444"} strokeWidth={1.5} />
+    </svg>
+  );
+}
+
+// ─── Price Source Status Banner ──────────────────────────────────────────────
+function PriceSourceBanner({ status, onRetry }) {
+  const { fetching, ok, diags, lastSuccess, lastAttempt } = status;
+
+  if (fetching && ok === null) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: 8, marginBottom: 10, background: "#fef3c7", border: "0.5px solid #f59e0b", fontSize: 11 }}>
+        <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>
+        <span style={{ color: "#92400e" }}>Fetching live prices from Coinbase Exchange…</span>
+        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  if (ok) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: 8, marginBottom: 10, background: "#d1fae5", border: "0.5px solid #10b981", fontSize: 11 }}>
+        <span style={{ color: "#065f46", fontSize: 14 }}>✓</span>
+        <span style={{ color: "#065f46", fontWeight: 600 }}>Live prices synced from Coinbase Exchange</span>
+        {lastSuccess && <span style={{ color: "#065f46", opacity: 0.7 }}>— last sync {lastSuccess}</span>}
+        {fetching && <span style={{ marginLeft: 4, color: "#065f46", opacity: 0.6 }}>syncing…</span>}
+      </div>
+    );
+  }
+
+  // Failed state — show full diagnostics per coin
+  const errorTypeLabels = {
+    no_proxy: "Proxy not configured",
+    cors: "CORS blocked — browser prevented the request",
+    network: "Network error — proxy unreachable",
+    http: "HTTP error — proxy or Coinbase rejected the request",
+    parse: "Parse error — unexpected response format",
+    empty: "Empty response — price field missing from proxy",
+  };
+
+  return (
+    <div style={{ padding: "10px 14px", borderRadius: 8, marginBottom: 10, background: "#fef2f2", border: "0.5px solid #ef4444", fontSize: 11 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ color: "#ef4444", fontSize: 15 }}>⚠</span>
+          <span style={{ color: "#991b1b", fontWeight: 600 }}>
+            Live price sync failed — showing simulated prices
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {lastAttempt && <span style={{ color: "#991b1b", opacity: 0.7 }}>last tried {lastAttempt}</span>}
+          <button onClick={onRetry} style={{ padding: "3px 10px", borderRadius: 5, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
+            Retry
+          </button>
+        </div>
+      </div>
+
+      {/* Per-coin breakdown */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {COINS.map((coin) => {
+          const d = diags[coin];
+          if (!d) return null;
+          return (
+            <div key={coin} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+              <span style={{ minWidth: 32, fontWeight: 600, color: d.ok ? "#065f46" : "#991b1b" }}>
+                {d.ok ? "✓" : "✗"} {coin}
+              </span>
+              {d.ok ? (
+                <span style={{ color: "#065f46" }}>${d.price?.toLocaleString()}</span>
+              ) : (
+                <span style={{ color: "#7f1d1d" }}>
+                  <strong style={{ color: "#ef4444" }}>[{d.errorType?.toUpperCase()}]</strong>{" "}
+                  {errorTypeLabels[d.errorType] || d.errorType}
+                  {d.errorMsg && d.errorMsg !== errorTypeLabels[d.errorType] && (
+                    <span style={{ opacity: 0.7 }}> — {d.errorMsg}</span>
+                  )}
+                  {d.httpStatus && <span style={{ opacity: 0.6 }}> (HTTP {d.httpStatus})</span>}
+                  {d.raw && (
+                    <div style={{ marginTop: 2, fontFamily: "monospace", fontSize: 10, opacity: 0.6, wordBreak: "break-all" }}>
+                      Raw: {d.raw}
+                    </div>
+                  )}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: 8, color: "#991b1b", lineHeight: 1.6, fontSize: 11 }}>
+        {diags[COINS[0]]?.errorType === "no_proxy" && (
+          <div style={{ background: "#fff7ed", border: "0.5px solid #f59e0b", borderRadius: 6, padding: "8px 10px", color: "#92400e" }}>
+            <strong>Setup required:</strong> Deploy the included <code>coinbase-cors-proxy</code> to Vercel,
+            then set <code style={{ background: "#fef3c7", padding: "1px 4px", borderRadius: 3 }}>PROXY_BASE</code> in
+            the source to your Cloud Run function URL.
+            See <strong>README.md</strong> inside the proxy folder for step-by-step instructions.
+          </div>
+        )}
+        {diags[COINS[0]]?.errorType === "cors" && (
+          <div style={{ opacity: 0.8 }}>
+            <strong>CORS blocked:</strong> The proxy URL may be wrong or not yet deployed.
+            Verify <code>PROXY_BASE</code> matches your Cloud Run function URL exactly.
+          </div>
+        )}
+        {diags[COINS[0]]?.errorType === "network" && (
+          <div style={{ opacity: 0.8 }}>
+            <strong>Network error:</strong> Proxy is unreachable — check the Vercel deployment is live and the URL is correct.
+          </div>
+        )}
+        {diags[COINS[0]]?.errorType === "http" && (
+          <div style={{ opacity: 0.8 }}>
+            <strong>HTTP {diags[COINS[0]]?.httpStatus}:</strong> The proxy responded with an error.
+            Check the Vercel function logs for details.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Rate Limit Monitor Panel ────────────────────────────────────────────────
+function RateLimitMonitor({ stats }) {
+  const readPct = Math.min((stats.readUsed / stats.readMax) * 100, 100);
+  const writePct = Math.min((stats.writeUsed / stats.writeMax) * 100, 100);
+  const readColor = readPct > 80 ? "#ef4444" : readPct > 50 ? "#f59e0b" : "#10b981";
+  const writeColor = writePct > 80 ? "#ef4444" : writePct > 50 ? "#f59e0b" : "#10b981";
+
+  return (
+    <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px 14px", marginBottom: 12 }}>
+      <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+        <i className="ti ti-activity" aria-hidden="true" /> API rate limits — 10-second rolling window
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 10 }}>
+        {[
+          { label: "Read (GET)", used: stats.readUsed, max: stats.readMax, pct: readPct, color: readColor, queued: stats.readQueued },
+          { label: "Write (POST)", used: stats.writeUsed, max: stats.writeMax, pct: writePct, color: writeColor, queued: stats.writeQueued },
+        ].map(({ label, used, max, pct, color, queued }) => (
+          <div key={label}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 5 }}>
+              <span style={{ color: "var(--color-text-secondary)" }}>{label}</span>
+              <span style={{ fontWeight: 600, color }}>
+                {used} / {max}
+                {queued > 0 && <span style={{ marginLeft: 6, color: "#f59e0b" }}>+{queued} queued</span>}
+              </span>
+            </div>
+            <div style={{ height: 6, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden" }}>
+              <div style={{ width: pct + "%", height: "100%", background: color, borderRadius: 3, transition: "width 0.3s ease" }} />
+            </div>
+            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
+              {(100 - pct).toFixed(0)}% headroom · {max - used} slots free
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 16, fontSize: 11, color: "var(--color-text-secondary)", borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8, flexWrap: "wrap" }}>
+        <span><i className="ti ti-refresh" aria-hidden="true" style={{ color: stats.retries > 0 ? "#f59e0b" : "inherit" }} /> Retries: <strong style={{ color: stats.retries > 0 ? "#f59e0b" : "var(--color-text-primary)" }}>{stats.retries}</strong></span>
+        <span><i className="ti ti-clock-pause" aria-hidden="true" style={{ color: stats.throttled > 0 ? "#f59e0b" : "inherit" }} /> Throttled: <strong style={{ color: stats.throttled > 0 ? "#f59e0b" : "var(--color-text-primary)" }}>{stats.throttled}</strong></span>
+        <span style={{ fontSize: 10 }}>Backoff: base {BASE_DELAY_MS}ms · max {MAX_BACKOFF_MS / 1000}s · {MAX_RETRIES} retries</span>
+        {stats.lastError && (
+          <span style={{ marginLeft: "auto", color: "#ef4444", fontSize: 10, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <i className="ti ti-alert-triangle" aria-hidden="true" /> {stats.lastError}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Settings Modal ───────────────────────────────────────────────────────────
+function SettingsModal({ creds, onSave, onClose }) {
+  const [form, setForm] = useState({
+    apiKeyName: creds.apiKeyName || "",
+    privateKey: creds.privateKey || "",
+    tradeSizeUSD: creds.tradeSizeUSD || "50",
+    minConfidence: creds.minConfidence || "60",
+    enabledCoins: creds.enabledCoins || ["BTC"],
+    sandbox: creds.sandbox !== undefined ? creds.sandbox : false,
+  });
+  const [showKey, setShowKey] = useState(false);
+  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const toggleCoin = (c) => set("enabledCoins", form.enabledCoins.includes(c) ? form.enabledCoins.filter((x) => x !== c) : [...form.enabledCoins, c]);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, padding: "24px 28px", width: 480, maxWidth: "96vw", maxHeight: "90vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 15 }}>Coinbase API settings</div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>Advanced Trade API — CDP credentials</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: "var(--color-text-secondary)", padding: 4 }}>
+            <i className="ti ti-x" aria-hidden="true" />
+          </button>
+        </div>
+
+        <div style={{ background: "var(--color-background-info)", border: "0.5px solid var(--color-border-info)", borderRadius: 8, padding: "10px 12px", marginBottom: 18, fontSize: 11, color: "var(--color-text-info)", lineHeight: 1.6 }}>
+          <i className="ti ti-info-circle" aria-hidden="true" /> Create CDP API keys at <strong>cdp.coinbase.com</strong> → API Keys → New key. Select <em>Advanced Trade</em> scope. Your private key is only stored in this browser session and never sent anywhere except Coinbase.
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <label style={{ fontSize: 12 }}>
+            <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>API Key Name <span style={{ color: "#ef4444" }}>*</span></div>
+            <input value={form.apiKeyName} onChange={(e) => set("apiKeyName", e.target.value)}
+              placeholder="organizations/xxx/apiKeys/yyy"
+              style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 11, boxSizing: "border-box" }} />
+          </label>
+
+          <label style={{ fontSize: 12 }}>
+            <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+              EC Private Key (PEM) <span style={{ color: "#ef4444" }}>*</span>
+              <button onClick={() => setShowKey((s) => !s)} style={{ marginLeft: 8, background: "none", border: "none", cursor: "pointer", fontSize: 11, color: "var(--color-text-secondary)" }}>
+                <i className={`ti ${showKey ? "ti-eye-off" : "ti-eye"}`} aria-hidden="true" /> {showKey ? "hide" : "show"}
+              </button>
+            </div>
+            <textarea
+              value={form.privateKey}
+              onChange={(e) => set("privateKey", e.target.value)}
+              placeholder={"-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----"}
+              rows={showKey ? 5 : 3}
+              style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 10, resize: "vertical", boxSizing: "border-box", filter: showKey ? "none" : "blur(4px)", userSelect: showKey ? "auto" : "none" }}
+            />
+          </label>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <label style={{ fontSize: 12 }}>
+              <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD)</div>
+              <input type="number" value={form.tradeSizeUSD} onChange={(e) => set("tradeSizeUSD", e.target.value)}
+                min="1" max="10000" style={{ width: "100%", boxSizing: "border-box" }} />
+            </label>
+            <label style={{ fontSize: 12 }}>
+              <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min confidence (%)</div>
+              <input type="number" value={form.minConfidence} onChange={(e) => set("minConfidence", e.target.value)}
+                min="50" max="97" style={{ width: "100%", boxSizing: "border-box" }} />
+            </label>
+          </div>
+
+          <div style={{ fontSize: 12 }}>
+            <div style={{ color: "var(--color-text-secondary)", marginBottom: 8 }}>Active trading pairs</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {COINS.map((c) => (
+                <button key={c} onClick={() => toggleCoin(c)}
+                  style={{
+                    padding: "5px 14px", borderRadius: 6, cursor: "pointer", fontWeight: 600, fontSize: 12,
+                    border: `0.5px solid ${form.enabledCoins.includes(c) ? COIN_COLORS[c] : "var(--color-border-tertiary)"}`,
+                    background: form.enabledCoins.includes(c) ? COIN_COLORS[c] + "22" : "transparent",
+                    color: form.enabledCoins.includes(c) ? COIN_COLORS[c] : "var(--color-text-secondary)",
+                  }}>{c}/USD</button>
+              ))}
+            </div>
+          </div>
+
+          <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={form.sandbox} onChange={(e) => set("sandbox", e.target.checked)} />
+            <span style={{ color: "var(--color-text-secondary)" }}>Sandbox / paper-trading mode (does not place real orders)</span>
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 22, justifyContent: "flex-end" }}>
+          <button onClick={onClose} style={{ padding: "7px 18px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontSize: 13, color: "var(--color-text-secondary)" }}>
+            Cancel
+          </button>
+          <button onClick={() => onSave(form)}
+            style={{ padding: "7px 22px", borderRadius: 7, border: "0.5px solid #10b981", background: "#d1fae5", color: "#065f46", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
+            <i className="ti ti-device-floppy" aria-hidden="true" /> Save credentials
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+export default function CryptoAlgoTrader() {
+  const [selectedCoin, setSelectedCoin] = useState("BTC");
+  const [running, setRunning] = useState(false);
+  const [speed, setSpeed] = useState(1500);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Coinbase automation state
+  const [creds, setCreds] = useState({ apiKeyName: "", privateKey: "", tradeSizeUSD: "50", minConfidence: "60", enabledCoins: ["BTC"], sandbox: false });
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoStatus, setAutoStatus] = useState("idle");
+  const [autoLog, setAutoLog] = useState([]);
+  const [cbBalances, setCbBalances] = useState(null);
+  const [cbError, setCbError] = useState(null);
+  const [rlStats, setRlStats] = useState(getRateLimitStats());
+  const [liveData, setLiveData] = useState({});
+  const [priceSourceStatus, setPriceSourceStatus] = useState({
+    fetching: true, ok: null, diags: {}, lastSuccess: null, lastAttempt: null,
+  });
+
+  const stateRef = useRef({
+    BTC: { prices: [COIN_BASE.BTC], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
+    ETH: { prices: [COIN_BASE.ETH], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
+    SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
+  });
+  const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
+  const [news, setNews] = useState([]);
+  const [activeSentiment, setActiveSentiment] = useState(0);
+  const [newsStatus, setNewsStatus] = useState("idle"); // idle | loading | ok | error
+  const newsIdRef = useRef(0);
+  const tickRef = useRef(0);
+  const autoLogIdRef = useRef(0);
+
+  const addAutoLog = useCallback((msg, type = "info") => {
+    const id = autoLogIdRef.current++;
+    const time = new Date().toLocaleTimeString();
+    setAutoLog((prev) => [{ id, msg, type, time }, ...prev.slice(0, 49)]);
+  }, []);
+
+  // ── Fetch real news from NewsData.io via proxy ───────────────────────────────
+  const fetchRealNews = useCallback(async () => {
+    if (!PROXY_BASE) return;
+    setNewsStatus("loading");
+    try {
+      const res = await fetch(NEWS_PROXY_URL, { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(`Proxy news HTTP ${res.status}`);
+      const payload = await res.json();
+      const articles = payload.articles || [];
+      if (articles.length === 0) throw new Error("No articles returned");
+
+      // Build sentiment average from all articles for the signal engine
+      const avgSentiment = articles.reduce((sum, a) => sum + (a.sentiment || 0), 0) / articles.length;
+      setActiveSentiment(avgSentiment);
+
+      // Format for display
+      const formatted = articles.map((a) => ({
+        id: newsIdRef.current++,
+        text: a.title,
+        description: a.description,
+        source: a.source,
+        url: a.url,
+        sentiment: a.sentiment,
+        sentimentLabel: a.sentimentLabel,
+        time: a.publishedAt
+          ? new Date(a.publishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : "now",
+      }));
+
+      setNews(formatted);
+      setNewsStatus("ok");
+    } catch (e) {
+      setNewsStatus("error");
+      console.error("News fetch failed:", e.message);
+    }
+  }, []);
+
+  // Fetch news on mount and every 5 minutes (NewsData free tier: ~200 req/day)
+  useEffect(() => {
+    fetchRealNews();
+    const id = setInterval(fetchRealNews, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [fetchRealNews]);
+
+  // ── Fetch prices via postMessage bridge (bypasses iframe CSP) ───────────────
+  // The artifact iframe cannot make fetch() calls to external domains due to
+  // Content-Security-Policy. We inject a tiny <script> into the parent page
+  // that fetches the proxy and sends results back via postMessage.
+  const fetchViaBridge = useCallback((isAnchor = false) => {
+    setPriceSourceStatus((p) => ({ ...p, fetching: true, lastAttempt: new Date().toLocaleTimeString() }));
+    const productList = COINS.map((c) => PRODUCT_IDS[c]).join(",");
+    const url = `${PROXY_BASE}?product=${productList}`;
+
+    // Inject a one-shot <script> into the parent document that fetches and postMessages back
+    try {
+      const script = window.parent.document.createElement("script");
+      script.id = "cbPriceBridge";
+      script.textContent = `
+        (async () => {
+          try {
+            const res = await fetch(${JSON.stringify(url)}, { headers: { Accept: "application/json" } });
+            const data = await res.json();
+            window.frames[0]?.postMessage({ type: "CB_PRICES", ok: true, data }, "*");
+          } catch(e) {
+            window.frames[0]?.postMessage({ type: "CB_PRICES", ok: false, error: e.message }, "*");
+          } finally {
+            document.getElementById("cbPriceBridge")?.remove();
+          }
+        })();
+      `;
+      // Remove any stale bridge script first
+      window.parent.document.getElementById("cbPriceBridge")?.remove();
+      window.parent.document.body.appendChild(script);
+    } catch (_) {
+      // Parent document not accessible (cross-origin) — fall back to direct fetch
+      fetchAllPublicPrices().then(({ prices, diags }) => {
+        applyPrices(prices, diags, isAnchor);
+      });
+    }
+  }, [autoEnabled]);
+
+  const applyPrices = useCallback((prices, diags, isAnchor = false) => {
+    const s = stateRef.current;
+    const anyOk = Object.keys(prices).length > 0;
+    for (const coin of COINS) {
+      if (prices[coin]) {
+        if (isAnchor && s[coin].prices.length > 1) {
+          s[coin].prices[s[coin].prices.length - 1] = prices[coin];
+        } else {
+          s[coin].prices = [prices[coin]];
+          s[coin].volumes = [1];
+        }
+      }
+    }
+    if (anyOk) setSnapshot(JSON.parse(JSON.stringify(s)));
+    setPriceSourceStatus({
+      fetching: false, ok: anyOk, diags,
+      lastSuccess: anyOk ? new Date().toLocaleTimeString() : null,
+      lastAttempt: new Date().toLocaleTimeString(),
+    });
+  }, []);
+
+  // ── Listen for postMessage responses from the bridge script ──────────────────
+  useEffect(() => {
+    const handler = (event) => {
+      if (event.data?.type !== "CB_PRICES") return;
+      if (!event.data.ok) {
+        const msg = event.data.error || "Bridge fetch failed";
+        const diags = {};
+        COINS.forEach(c => { diags[c] = { ok: false, errorType: "network", errorMsg: msg }; });
+        setPriceSourceStatus(p => ({ ...p, fetching: false, ok: false, diags,
+          lastAttempt: new Date().toLocaleTimeString() }));
+        return;
+      }
+      // Parse the proxy payload
+      const payload = event.data.data;
+      const prices = {}, diags = {};
+      COINS.forEach(coin => {
+        const coinData = payload?.data?.[coin];
+        const price = parseFloat(coinData?.price);
+        if (!coinData || isNaN(price)) {
+          diags[coin] = { ok: false, errorType: "empty",
+            errorMsg: `${coin} missing from response` };
+        } else {
+          prices[coin] = price;
+          diags[coin] = { ok: true, price,
+            bid: parseFloat(coinData.bid)||null, ask: parseFloat(coinData.ask)||null };
+        }
+      });
+      applyPrices(prices, diags, false);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [applyPrices]);
+
+  // ── Bootstrap on mount ────────────────────────────────────────────────────────
+  useEffect(() => { fetchViaBridge(false); }, []);
+
+  // ── Re-anchor every 15s ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const id = setInterval(() => { if (!autoEnabled) fetchViaBridge(true); }, 15_000);
+    return () => clearInterval(id);
+  }, [autoEnabled, fetchViaBridge]);
+
+  // ── Poll rate-limit stats every 500ms ──────────────────────────────────────
+  useEffect(() => {
+    const id = setInterval(() => setRlStats(getRateLimitStats()), 500);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Fetch live Coinbase prices + orderbook + candles ───────────────────────
+  const fetchLiveMarketData = useCallback(async () => {
+    if (!creds.apiKeyName || !creds.privateKey) return;
+    try {
+      // Batch: best bid/ask for all enabled coins in one request
+      const productList = creds.enabledCoins.map((c) => PRODUCT_IDS[c]).join("&product_ids=");
+      const priceData = await cbFetch(creds, "GET", `/best_bid_ask?product_ids=${productList}`);
+      const newLiveData = { ...liveData };
+
+      for (const coin of creds.enabledCoins) {
+        const pid = PRODUCT_IDS[coin];
+        const entry = priceData.pricebooks?.find((pb) => pb.product_id === pid);
+        if (entry) {
+          const price = parseFloat(entry.asks?.[0]?.price || entry.bids?.[0]?.price);
+          const bidSize = parseFloat(entry.bids?.[0]?.size || 0);
+          const askSize = parseFloat(entry.asks?.[0]?.size || 0);
+          if (!isNaN(price) && price > 0) {
+            const s = stateRef.current[coin];
+            s.prices.push(price);
+            if (s.prices.length > 200) s.prices.shift();
+            // Derive volume proxy from bid/ask depth
+            const vol = Math.max(0.3, (bidSize + askSize) / 2);
+            s.volumes.push(vol);
+            if (s.volumes.length > 200) s.volumes.shift();
+            newLiveData[coin] = {
+              ...newLiveData[coin],
+              bid: parseFloat(entry.bids?.[0]?.price),
+              ask: parseFloat(entry.asks?.[0]?.price),
+              spread: parseFloat(entry.asks?.[0]?.price) - parseFloat(entry.bids?.[0]?.price),
+              bidSize, askSize,
+            };
+          }
+        }
+      }
+
+      // Fetch orderbook for selected coin (single extra call)
+      try {
+        const ob = await cbGetOrderBook(creds, PRODUCT_IDS[creds.enabledCoins[0]]);
+        if (ob?.pricebook) {
+          newLiveData[creds.enabledCoins[0]] = {
+            ...newLiveData[creds.enabledCoins[0]],
+            topBids: ob.pricebook.bids?.slice(0, 5) || [],
+            topAsks: ob.pricebook.asks?.slice(0, 5) || [],
+          };
+        }
+      } catch (_) {} // non-critical
+
+      setLiveData(newLiveData);
+      addAutoLog(`Market data updated — ${creds.enabledCoins.join(", ")}`, "info");
+    } catch (e) {
+      addAutoLog(`Market data error: ${e.message}`, "error");
+    }
+  }, [creds, addAutoLog]);
+
+  // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
+  const fetchBalances = useCallback(async () => {
+    if (!creds.apiKeyName || !creds.privateKey) return;
+    setCbError(null);
+    try {
+      const data = await cbGetAccounts(creds);
+      const accounts = data.accounts || [];
+      const balances = { USD: 0 };
+      for (const acc of accounts) {
+        const val = parseFloat(acc.available_balance?.value || 0);
+        if (acc.currency === "USD") balances.USD = val;
+        else if (COINS.includes(acc.currency)) balances[acc.currency] = val;
+      }
+      // Also fetch recent fills for the first enabled coin
+      try {
+        const fills = await cbGetFills(creds, PRODUCT_IDS[creds.enabledCoins[0]]);
+        balances._recentFills = fills.fills?.slice(0, 5) || [];
+      } catch (_) {}
+      setCbBalances(balances);
+      addAutoLog(`Balances refreshed — USD $${balances.USD?.toFixed(2)}`, "success");
+    } catch (e) {
+      setCbError(e.message);
+      addAutoLog(`Balance fetch failed: ${e.message}`, "error");
+    }
+  }, [creds, addAutoLog]);
+
+  // ── Execute a real trade on Coinbase ───────────────────────────────────────
+  const executeRealTrade = useCallback(async (coin, action, price, confidence) => {
+    if (creds.sandbox) {
+      addAutoLog(`[SANDBOX] ${action} ${coin} @ $${price.toFixed(2)} (conf ${confidence}%)`, "sandbox");
+      return { success: true, sandbox: true };
+    }
+    const minConf = parseFloat(creds.minConfidence);
+    if (confidence < minConf) {
+      addAutoLog(`Skipped ${action} ${coin}: confidence ${confidence}% < threshold ${minConf}%`, "warn");
+      return { success: false, reason: "low_confidence" };
+    }
+    try {
+      const tradeUSD = parseFloat(creds.tradeSizeUSD);
+      const baseSize = tradeUSD / price;
+      const result = await cbPlaceOrder(creds, PRODUCT_IDS[coin], action, tradeUSD, baseSize);
+      addAutoLog(`✓ ${action} ${coin}/USD order placed — ID: ${result.order_id?.slice(0, 12)}... @ $${price.toFixed(2)}`, "success");
+      await fetchBalances();
+      return { success: true, orderId: result.order_id };
+    } catch (e) {
+      addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
+      return { success: false, error: e.message };
+    }
+  }, [creds, addAutoLog, fetchBalances]);
+
+  // ── Start / Stop automation ─────────────────────────────────────────────────
+  const startAutomation = useCallback(async () => {
+    if (!creds.apiKeyName || !creds.privateKey) {
+      setCbError("No credentials — open Settings first");
+      return;
+    }
+    setAutoStatus("connecting");
+    addAutoLog("Connecting to Coinbase Advanced Trade API...", "info");
+    try {
+      await fetchBalances();
+      await fetchLiveMarketData();
+      setAutoStatus("live");
+      setAutoEnabled(true);
+      addAutoLog(`Automation started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
+    } catch (e) {
+      setAutoStatus("error");
+      setCbError(e.message);
+      addAutoLog(`Connection failed: ${e.message}`, "error");
+    }
+  }, [creds, fetchBalances, fetchLiveMarketData, addAutoLog]);
+
+  const stopAutomation = useCallback(() => {
+    setAutoEnabled(false);
+    setAutoStatus("idle");
+    addAutoLog("Automation stopped by user", "warn");
+  }, [addAutoLog]);
+
+  // ── Main simulation tick ────────────────────────────────────────────────────
+  const runTick = useCallback(() => {
+    const s = stateRef.current;
+    tickRef.current += 1;
+
+    // News is fetched on a real interval — nothing to do per tick
+
+    // Fetch live market data every 5 ticks if automation is active
+    if (autoEnabled && tickRef.current % 5 === 0) fetchLiveMarketData();
+
+    COINS.forEach((coin) => {
+      const cs = s[coin];
+      const lastPrice = cs.prices[cs.prices.length - 1];
+
+      // If not using live data for this coin, simulate
+      if (!autoEnabled || !creds.enabledCoins.includes(coin)) {
+        const vol = coin === "SOL" ? 0.002 : coin === "ETH" ? 0.0016 : 0.0012;
+        cs.prices.push(generatePrice(lastPrice, vol));
+        if (cs.prices.length > 200) cs.prices.shift();
+        const lv = cs.volumes[cs.volumes.length - 1];
+        cs.volumes.push(Math.max(0.3, lv + (Math.random() - 0.48) * 0.3));
+        if (cs.volumes.length > 200) cs.volumes.shift();
+      }
+
+      const newPrice = cs.prices[cs.prices.length - 1];
+      const avgVol = cs.volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(cs.volumes.length, 20);
+      const volumeRatio = (cs.volumes[cs.volumes.length - 1] || 1) / avgVol;
+
+      const indicators = {
+        currentPrice: newPrice,
+        sma20: calcSMA(cs.prices, 20),
+        sma50: calcSMA(cs.prices, 50),
+        rsi: calcRSI(cs.prices, 14),
+        boll: calcBollinger(cs.prices, 20),
+        macd: calcMACD(cs.prices),
+      };
+
+      const signal = generateSignal(indicators, activeSentiment, volumeRatio);
+
+      // Execute trades
+      if (signal.action === "BUY" && !cs.position) {
+        cs.position = { price: newPrice, size: 1 };
+        cs.trades++;
+        if (autoEnabled && creds.enabledCoins.includes(coin)) {
+          executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence));
+        }
+      } else if (signal.action === "SELL" && cs.position) {
+        const profit = (newPrice - cs.position.price) / cs.position.price * 100;
+        cs.pnl += profit;
+        cs.position = null;
+        cs.trades++;
+        if (autoEnabled && creds.enabledCoins.includes(coin)) {
+          executeRealTrade(coin, "SELL", newPrice, parseFloat(signal.confidence));
+        }
+      }
+
+      const unrealized = cs.position ? (newPrice - cs.position.price) / cs.position.price * 100 : 0;
+      cs.history.push({
+        t: tickRef.current, price: newPrice,
+        sma20: indicators.sma20, sma50: indicators.sma50,
+        bUpper: indicators.boll?.upper, bLower: indicators.boll?.lower,
+        rsi: indicators.rsi, action: signal.action,
+        confidence: parseFloat(signal.confidence),
+        score: parseFloat(signal.score),
+        volumeRatio, reasons: signal.reasons,
+        pnl: cs.pnl + unrealized,
+      });
+      if (cs.history.length > 80) cs.history.shift();
+    });
+
+    setSnapshot(JSON.parse(JSON.stringify(s)));
+  }, [autoEnabled, creds, activeSentiment, fetchLiveMarketData, executeRealTrade]);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(runTick, speed);
+    return () => clearInterval(id);
+  }, [running, speed, runTick]);
+
+  // ── Derived display data ───────────────────────────────────────────────────
+  const coin = snapshot[selectedCoin];
+  const lastH = coin.history[coin.history.length - 1];
+  const currentPrice = coin.prices[coin.prices.length - 1];
+  const priceChange = coin.prices.length > 1 ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100 : 0;
+  const unrealized = coin.position ? ((currentPrice - coin.position.price) / coin.position.price) * 100 : 0;
+
+  const chartData = coin.history.slice(-60).map((h, i) => ({
+    i, price: +h.price.toFixed(2),
+    sma20: h.sma20 ? +h.sma20.toFixed(2) : null,
+    sma50: h.sma50 ? +h.sma50.toFixed(2) : null,
+    bUpper: h.bUpper ? +h.bUpper.toFixed(2) : null,
+    bLower: h.bLower ? +h.bLower.toFixed(2) : null,
+  }));
+  const rsiData = coin.history.slice(-60).map((h, i) => ({ i, rsi: h.rsi ? +h.rsi.toFixed(1) : null }));
+  const pnlData = coin.history.slice(-60).map((h, i) => ({ i, pnl: +h.pnl.toFixed(3) }));
+
+  const statusColor = { idle: "#94a3b8", connecting: "#f59e0b", live: "#10b981", error: "#ef4444" }[autoStatus];
+  const statusLabel = { idle: "Automation idle", connecting: "Connecting…", live: creds.sandbox ? "Sandbox live" : "Live trading", error: "Connection error" }[autoStatus];
+  const logTypeColor = { info: "var(--color-text-secondary)", success: "#10b981", error: "#ef4444", warn: "#f59e0b", sandbox: "#6366f1" };
+  const hasCredentials = creds.apiKeyName && creds.privateKey;
+
+  const retryPriceFetch = useCallback(() => { fetchViaBridge(false); }, [fetchViaBridge]);
+
+  return (
+    <div style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 13, color: "var(--color-text-primary)", padding: "12px 0" }}>
+      <h2 className="sr-only">Crypto Algo Trading Dashboard with Coinbase Automation</h2>
+      {showSettings && <SettingsModal creds={creds} onSave={(f) => { setCreds(f); setShowSettings(false); addAutoLog("Credentials updated", "info"); }} onClose={() => setShowSettings(false)} />}
+
+      {/* ── Top toolbar ──────────────────────────────────────────────────────── */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        {COINS.map((c) => (
+          <button key={c} onClick={() => setSelectedCoin(c)}
+            style={{
+              padding: "5px 12px", borderRadius: 6, border: "0.5px solid",
+              borderColor: selectedCoin === c ? COIN_COLORS[c] : "var(--color-border-tertiary)",
+              background: selectedCoin === c ? COIN_COLORS[c] + "22" : "transparent",
+              color: selectedCoin === c ? COIN_COLORS[c] : "var(--color-text-secondary)",
+              cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 13,
+            }}>{c}</button>
+        ))}
+
+        <div style={{ display: "flex", gap: 6, marginLeft: "auto", alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Speed</label>
+          <input type="range" min="400" max="3000" step="200" value={speed} onChange={(e) => setSpeed(+e.target.value)} style={{ width: 70 }} />
+          <span style={{ fontSize: 11, color: "var(--color-text-secondary)", minWidth: 32 }}>{(speed / 1000).toFixed(1)}s</span>
+
+          <button onClick={() => setRunning((r) => !r)}
+            style={{ padding: "5px 14px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: running ? "#fee2e2" : "#d1fae5", color: running ? "#991b1b" : "#065f46", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
+            <i className={`ti ${running ? "ti-player-pause" : "ti-player-play"}`} aria-hidden="true" /> {running ? "Pause" : "Start"}
+          </button>
+
+          <button onClick={() => setShowSettings(true)}
+            style={{ padding: "5px 14px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 12, color: "var(--color-text-secondary)", display: "flex", alignItems: "center", gap: 5 }}>
+            <i className="ti ti-settings" aria-hidden="true" /> Settings
+            {hasCredentials && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981", display: "inline-block" }} />}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Coinbase Automation Panel ─────────────────────────────────────────── */}
+      <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${autoEnabled ? statusColor + "88" : "var(--color-border-tertiary)"}`, padding: "14px 16px", marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, display: "inline-block", boxShadow: autoEnabled ? `0 0 6px ${statusColor}` : "none" }} />
+            <span style={{ fontWeight: 600, fontSize: 13 }}>Coinbase automation</span>
+            <span style={{ fontSize: 11, color: statusColor, fontWeight: 500 }}>{statusLabel}</span>
+          </div>
+
+          {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
+
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            {cbBalances && (
+              <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                USD: <strong>${fmt(cbBalances.USD)}</strong>
+                {creds.enabledCoins.map((c) => (
+                  <span key={c}> · {c}: <strong>{cbBalances[c]?.toFixed(4)}</strong></span>
+                ))}
+              </span>
+            )}
+            {hasCredentials && cbBalances && (
+              <button onClick={fetchBalances} style={{ padding: "3px 8px", borderRadius: 5, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontSize: 11, color: "var(--color-text-secondary)" }}>
+                <i className="ti ti-refresh" aria-hidden="true" />
+              </button>
+            )}
+            {!autoEnabled ? (
+              <button onClick={startAutomation} disabled={!hasCredentials}
+                style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "var(--color-background-secondary)", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.5 }}>
+                <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start automation" : "Add credentials first"}
+              </button>
+            ) : (
+              <button onClick={stopAutomation}
+                style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
+                <i className="ti ti-player-stop" aria-hidden="true" /> Stop automation
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Automation log */}
+        {autoLog.length > 0 && (
+          <div style={{ marginTop: 10, borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 8, maxHeight: 90, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
+            {autoLog.slice(0, 8).map((l) => (
+              <div key={l.id} style={{ display: "flex", gap: 8, fontSize: 10, lineHeight: 1.4 }}>
+                <span style={{ color: "var(--color-text-tertiary)", minWidth: 60 }}>{l.time}</span>
+                <span style={{ color: logTypeColor[l.type] }}>{l.msg}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── Rate Limit Monitor ───────────────────────────────────────────────── */}
+      <PriceSourceBanner status={priceSourceStatus} onRetry={retryPriceFetch} />
+      <RateLimitMonitor stats={rlStats} />
+
+      {/* ── Ticker row ───────────────────────────────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8, marginBottom: 14 }}>
+        {COINS.map((c) => {
+          const cs = snapshot[c];
+          const p = cs.prices[cs.prices.length - 1];
+          const chg = cs.prices.length > 1 ? ((p - cs.prices[0]) / cs.prices[0]) * 100 : 0;
+          const isLive = autoEnabled && creds.enabledCoins.includes(c);
+          return (
+            <div key={c} onClick={() => setSelectedCoin(c)}
+              style={{
+                background: "var(--color-background-secondary)", borderRadius: 8, padding: "10px 12px",
+                border: `0.5px solid ${selectedCoin === c ? COIN_COLORS[c] : "var(--color-border-tertiary)"}`,
+                cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center",
+              }}>
+              <div>
+                <div style={{ fontSize: 11, color: COIN_COLORS[c], fontWeight: 700, marginBottom: 1, display: "flex", alignItems: "center", gap: 5 }}>
+                  {c}/USD
+                  {isLive && <span style={{ fontSize: 9, background: "#d1fae5", color: "#065f46", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>LIVE</span>}
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 600 }}>${fmt(p, c === "BTC" ? 0 : 2)}</div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: chg >= 0 ? "#10b981" : "#ef4444" }}>{fmtPct(chg)}</div>
+              </div>
+              <MiniChart data={cs.history.slice(-30).map((h) => ({ price: h.price }))} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* ── Main price chart ─────────────────────────────────────────────────── */}
+      <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 12px", marginBottom: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ display: "flex", gap: 16, alignItems: "baseline" }}>
+            <span style={{ fontSize: 15, fontWeight: 600, color: COIN_COLORS[selectedCoin] }}>{selectedCoin}/USD</span>
+            <span style={{ fontSize: 20, fontWeight: 700 }}>${fmt(currentPrice, selectedCoin === "BTC" ? 0 : 2)}</span>
+            <span style={{ fontWeight: 600, color: priceChange >= 0 ? "#10b981" : "#ef4444" }}>{fmtPct(priceChange)}</span>
+          </div>
+          <div style={{ display: "flex", gap: 12, fontSize: 10, color: "var(--color-text-secondary)" }}>
+            {[["Price", COIN_COLORS[selectedCoin]], ["SMA20", "#f59e0b"], ["SMA50", "#6366f1"], ["BB", "#94a3b8"]].map(([l, c]) => (
+              <span key={l} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ width: 16, height: 2, background: c, display: "inline-block" }} />{l}
+              </span>
+            ))}
+          </div>
+        </div>
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+            <XAxis dataKey="i" hide />
+            <YAxis domain={["auto", "auto"]} width={60} tick={{ fontSize: 10 }} tickFormatter={(v) => selectedCoin === "BTC" ? `$${(v / 1000).toFixed(1)}k` : `$${v.toFixed(0)}`} />
+            <Tooltip formatter={(v) => [`$${fmt(v, 2)}`]} labelFormatter={() => ""} contentStyle={{ fontSize: 11, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }} />
+            <Line type="monotone" dataKey="bUpper" stroke="#94a3b8" strokeWidth={1} dot={false} strokeDasharray="2 2" />
+            <Line type="monotone" dataKey="bLower" stroke="#94a3b8" strokeWidth={1} dot={false} strokeDasharray="2 2" />
+            <Line type="monotone" dataKey="sma50" stroke="#6366f1" strokeWidth={1.2} dot={false} strokeDasharray="3 3" />
+            <Line type="monotone" dataKey="sma20" stroke="#f59e0b" strokeWidth={1.2} dot={false} strokeDasharray="4 2" />
+            <Line type="monotone" dataKey="price" stroke={COIN_COLORS[selectedCoin]} strokeWidth={1.8} dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ── RSI + P&L charts ─────────────────────────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>RSI (14)</div>
+          <ResponsiveContainer width="100%" height={80}>
+            <LineChart data={rsiData} margin={{ top: 2, right: 4, left: 0, bottom: 0 }}>
+              <XAxis dataKey="i" hide />
+              <YAxis domain={[0, 100]} width={28} tick={{ fontSize: 9 }} ticks={[30, 50, 70]} />
+              <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 2" strokeWidth={0.8} />
+              <ReferenceLine y={30} stroke="#10b981" strokeDasharray="3 2" strokeWidth={0.8} />
+              <Tooltip formatter={(v) => [v?.toFixed(1), "RSI"]} labelFormatter={() => ""} contentStyle={{ fontSize: 10 }} />
+              <Line type="monotone" dataKey="rsi" stroke="#a855f7" strokeWidth={1.5} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+          {lastH?.rsi && <div style={{ fontSize: 11, marginTop: 4, color: lastH.rsi > 70 ? "#ef4444" : lastH.rsi < 30 ? "#10b981" : "var(--color-text-secondary)" }}>
+            {lastH.rsi.toFixed(1)} — {lastH.rsi > 70 ? "Overbought" : lastH.rsi < 30 ? "Oversold" : "Neutral"}
+          </div>}
+        </div>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>Cumulative P&L (%)</div>
+          <ResponsiveContainer width="100%" height={80}>
+            <LineChart data={pnlData} margin={{ top: 2, right: 4, left: 0, bottom: 0 }}>
+              <XAxis dataKey="i" hide />
+              <YAxis width={36} tick={{ fontSize: 9 }} tickFormatter={(v) => v.toFixed(1) + "%"} />
+              <ReferenceLine y={0} stroke="var(--color-border-secondary)" strokeWidth={0.8} />
+              <Tooltip formatter={(v) => [v?.toFixed(3) + "%", "P&L"]} labelFormatter={() => ""} contentStyle={{ fontSize: 10 }} />
+              <Line type="monotone" dataKey="pnl" stroke={coin.pnl >= 0 ? "#10b981" : "#ef4444"} strokeWidth={1.5} dot={false} />
+            </LineChart>
+          </ResponsiveContainer>
+          <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
+            Total: {fmtPct(coin.pnl + unrealized)} — {coin.trades} trades
+          </div>
+        </div>
+      </div>
+
+      {/* ── Signal analysis + indicators + position ───────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 12, marginBottom: 12 }}>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10 }}>Current signal analysis</div>
+          {lastH ? (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                <Badge action={lastH.action} />
+                <div>
+                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Confidence</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ width: 100, height: 5, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ width: lastH.confidence + "%", height: "100%", background: lastH.action === "BUY" ? "#10b981" : lastH.action === "SELL" ? "#ef4444" : "#f59e0b", borderRadius: 3 }} />
+                    </div>
+                    <span style={{ fontWeight: 600 }}>{lastH.confidence}%</span>
+                  </div>
+                </div>
+                <div style={{ marginLeft: "auto", textAlign: "right" }}>
+                  <div style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>Score</div>
+                  <div style={{ fontWeight: 700, color: lastH.score > 0 ? "#10b981" : lastH.score < 0 ? "#ef4444" : "var(--color-text-secondary)" }}>{lastH.score > 0 ? "+" : ""}{lastH.score}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                {lastH.reasons.map((r, i) => {
+                  const up = r.includes("bullish") || r.includes("oversold") || r.includes("Positive") || r.includes("below");
+                  const neutral = r.includes("neutral") || r.includes("avg");
+                  return (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
+                      <i className={`ti ${up ? "ti-arrow-up" : neutral ? "ti-minus" : "ti-arrow-down"}`} aria-hidden="true"
+                        style={{ color: up ? "#10b981" : neutral ? "#94a3b8" : "#ef4444", fontSize: 13 }} />
+                      <span style={{ color: "var(--color-text-secondary)" }}>{r}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <div style={{ color: "var(--color-text-secondary)", fontSize: 12 }}>Press Start to begin analysis</div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px", flex: 1 }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8 }}>Position</div>
+            {coin.position ? (
+              <>
+                <div style={{ fontSize: 11, marginBottom: 3 }}>Entry: <strong>${fmt(coin.position.price, 2)}</strong></div>
+                <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: unrealized >= 0 ? "#10b981" : "#ef4444" }}>Unrealized: {fmtPct(unrealized)}</div>
+                {autoEnabled && <div style={{ fontSize: 10, marginTop: 4, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> Managed by algo</div>}
+              </>
+            ) : (
+              <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>No open position</div>
+            )}
+          </div>
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>Indicators</div>
+            {lastH && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11 }}>
+                <div>SMA20: <strong>${fmt(calcSMA(coin.prices, 20), 0)}</strong></div>
+                <div>SMA50: <strong>${fmt(calcSMA(coin.prices, 50), 0)}</strong></div>
+                <div>MACD: <strong style={{ color: (calcMACD(coin.prices) || 0) > 0 ? "#10b981" : "#ef4444" }}>{fmt(calcMACD(coin.prices), 2)}</strong></div>
+                <div>Vol ratio: <strong>{lastH.volumeRatio?.toFixed(2)}x</strong></div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ── News + Signal log ────────────────────────────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span><i className="ti ti-news" aria-hidden="true" /> Live crypto news</span>
+            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 5 }}>
+              {newsStatus === "loading" && <span style={{ color: "#f59e0b" }}>fetching…</span>}
+              {newsStatus === "error" && <span style={{ color: "#ef4444" }}>fetch failed</span>}
+              {newsStatus === "ok" && <span style={{ color: "#10b981" }}>● live · NewsData.io</span>}
+              <button onClick={fetchRealNews} title="Refresh news"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-text-secondary)", fontSize: 13, padding: "0 2px" }}>
+                <i className="ti ti-refresh" aria-hidden="true" />
+              </button>
+            </span>
+          </div>
+          {newsStatus === "loading" && news.length === 0 && (
+            <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", padding: "8px 0" }}>Loading real news…</div>
+          )}
+          {newsStatus === "error" && news.length === 0 && (
+            <div style={{ fontSize: 11, color: "#ef4444", padding: "8px 0" }}>
+              Could not load news. Check proxy /news route is deployed.
+            </div>
+          )}
+          <div style={{ maxHeight: 240, overflowY: "auto", display: "flex", flexDirection: "column", gap: 0 }}>
+            {news.map((n) => {
+              const sentColor = n.sentiment > 0.1 ? "#10b981" : n.sentiment < -0.1 ? "#ef4444" : "#f59e0b";
+              const icon = n.sentiment > 0.1 ? "ti-trending-up" : n.sentiment < -0.1 ? "ti-trending-down" : "ti-minus";
+              return (
+                <div key={n.id} style={{ display: "flex", gap: 8, alignItems: "flex-start", paddingBottom: 8, marginBottom: 8, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                  <i className={`ti ${icon}`} style={{ color: sentColor, fontSize: 14, marginTop: 2, flexShrink: 0 }} aria-hidden="true" />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {n.url ? (
+                      <a href={n.url} target="_blank" rel="noopener noreferrer"
+                        style={{ fontSize: 11, color: "var(--color-text-primary)", textDecoration: "none", display: "block", lineHeight: 1.4 }}
+                        onMouseOver={e => e.target.style.textDecoration = "underline"}
+                        onMouseOut={e => e.target.style.textDecoration = "none"}>
+                        {n.text}
+                      </a>
+                    ) : (
+                      <div style={{ fontSize: 11, lineHeight: 1.4 }}>{n.text}</div>
+                    )}
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2, display: "flex", gap: 8 }}>
+                      <span>{n.source}</span>
+                      <span>{n.time}</span>
+                    </div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 600, color: sentColor, flexShrink: 0 }}>
+                    {n.sentiment >= 0 ? "+" : ""}{(n.sentiment * 100).toFixed(0)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8 }}><i className="ti ti-history" aria-hidden="true" /> Signal log</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+            {coin.history.slice(-12).reverse().map((h, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, padding: "3px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                <Badge action={h.action} />
+                <span style={{ color: "var(--color-text-secondary)" }}>${fmt(h.price, selectedCoin === "BTC" ? 0 : 2)}</span>
+                <span style={{ marginLeft: "auto", color: "var(--color-text-tertiary)", fontSize: 10 }}>conf {h.confidence}%</span>
+              </div>
+            ))}
+            {coin.history.length === 0 && <div style={{ color: "var(--color-text-tertiary)", fontSize: 11 }}>No signals yet — press Start</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Status bar ───────────────────────────────────────────────────────── */}
+      <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", display: "flex", gap: 14, fontSize: 11, color: "var(--color-text-secondary)", flexWrap: "wrap", alignItems: "center" }}>
+        <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current}</span>
+        <span style={{ color: running ? "#10b981" : "#ef4444" }}><i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" /> {running ? "Algo running" : "Paused"}</span>
+        <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
+        {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>SANDBOX MODE — no real orders</span>}
+        <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
+          P&L: {fmtPct(coin.pnl + unrealized)} ({coin.trades} trades)
+        </span>
+      </div>
+    </div>
+  );
+}
