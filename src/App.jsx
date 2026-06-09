@@ -758,9 +758,49 @@ export default function CryptoAlgoTrader() {
     if (!PROXY_BASE) return;
     setNewsStatus("loading");
     try {
-      const res = await fetch(NEWS_PROXY_URL, { headers: { Accept: "application/json" } });
-      if (!res.ok) throw new Error(`Proxy news HTTP ${res.status}`);
-      const payload = await res.json();
+      // Use direct fetch when top-level (Vite/Netlify), bridge when in Claude iframe
+      let payload;
+      if (window !== window.parent) {
+        // In iframe — use a promise that resolves via postMessage bridge
+        payload = await new Promise((resolve, reject) => {
+          const handler = (e) => {
+            if (e.data?.type !== "CB_NEWS") return;
+            window.removeEventListener("message", handler);
+            if (e.data.ok) resolve(e.data.payload);
+            else reject(new Error(e.data.error));
+          };
+          window.addEventListener("message", handler);
+          setTimeout(() => { window.removeEventListener("message", handler); reject(new Error("News bridge timeout")); }, 10000);
+          try {
+            const script = window.parent.document.createElement("script");
+            script.id = "cbNewsBridge";
+            script.textContent = `
+              (async () => {
+                try {
+                  const res = await fetch(${JSON.stringify(NEWS_PROXY_URL)}, { headers: { Accept: "application/json" } });
+                  const payload = await res.json();
+                  window.frames[0]?.postMessage({ type: "CB_NEWS", ok: true, payload }, "*");
+                } catch(e) {
+                  window.frames[0]?.postMessage({ type: "CB_NEWS", ok: false, error: e.message }, "*");
+                } finally {
+                  document.getElementById("cbNewsBridge")?.remove();
+                }
+              })();
+            `;
+            window.parent.document.getElementById("cbNewsBridge")?.remove();
+            window.parent.document.body.appendChild(script);
+          } catch (_) {
+            // Cross-origin fallback
+            fetch(NEWS_PROXY_URL, { headers: { Accept: "application/json" } })
+              .then(r => r.json()).then(resolve).catch(reject);
+          }
+        });
+      } else {
+        // Top-level page — direct fetch works fine
+        const res = await fetch(NEWS_PROXY_URL, { headers: { Accept: "application/json" } });
+        if (!res.ok) throw new Error(`Proxy news HTTP ${res.status}`);
+        payload = await res.json();
+      }
       const articles = payload.articles || [];
       if (articles.length === 0) throw new Error("No articles returned");
 
@@ -797,16 +837,24 @@ export default function CryptoAlgoTrader() {
     return () => clearInterval(id);
   }, [fetchRealNews]);
 
-  // ── Fetch prices via postMessage bridge (bypasses iframe CSP) ───────────────
-  // The artifact iframe cannot make fetch() calls to external domains due to
-  // Content-Security-Policy. We inject a tiny <script> into the parent page
-  // that fetches the proxy and sends results back via postMessage.
+  // ── Detect execution context ─────────────────────────────────────────────────
+  // inIframe = true  → running inside a sandboxed Claude artifact iframe
+  // inIframe = false → running as a top-level page (Vite, Netlify, CodeSandbox top frame)
+  const inIframe = window !== window.parent;
+
+  // ── Fetch prices: direct fetch when top-level, bridge when in iframe ──────────
   const fetchViaBridge = useCallback((isAnchor = false) => {
     setPriceSourceStatus((p) => ({ ...p, fetching: true, lastAttempt: new Date().toLocaleTimeString() }));
+
+    if (!inIframe) {
+      // Top-level page (Vite / Netlify / published app) — fetch directly, no CSP restriction
+      fetchAllPublicPrices().then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
+      return;
+    }
+
+    // Inside iframe (Claude artifact) — inject bridge script into parent to bypass CSP
     const productList = COINS.map((c) => PRODUCT_IDS[c]).join(",");
     const url = `${PROXY_BASE}?product=${productList}`;
-
-    // Inject a one-shot <script> into the parent document that fetches and postMessages back
     try {
       const script = window.parent.document.createElement("script");
       script.id = "cbPriceBridge";
@@ -823,16 +871,13 @@ export default function CryptoAlgoTrader() {
           }
         })();
       `;
-      // Remove any stale bridge script first
       window.parent.document.getElementById("cbPriceBridge")?.remove();
       window.parent.document.body.appendChild(script);
     } catch (_) {
-      // Parent document not accessible (cross-origin) — fall back to direct fetch
-      fetchAllPublicPrices().then(({ prices, diags }) => {
-        applyPrices(prices, diags, isAnchor);
-      });
+      // Cross-origin parent — fall back to direct fetch
+      fetchAllPublicPrices().then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
     }
-  }, [autoEnabled]);
+  }, [inIframe]);
 
   const applyPrices = useCallback((prices, diags, isAnchor = false) => {
     const s = stateRef.current;
