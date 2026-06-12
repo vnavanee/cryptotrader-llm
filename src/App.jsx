@@ -449,25 +449,6 @@ function _rlRecord(providerId, bucket) {
   _getRLBucket(providerId, bucket).timestamps.push(Date.now());
 }
 
-// Global retry/throttle stats (used by RateLimitMonitor)
-const _rl = {
-  READ:  { timestamps: [] }, WRITE: { timestamps: [] },
-  stats: { readUsed: 0, writeUsed: 0, readQueued: 0, writeQueued: 0, retries: 0, throttled: 0, lastError: null },
-};
-function _pruneWindow(bucket) {
-  const cutoff = Date.now() - RATE_LIMITS[bucket].windowMs;
-  _rl[bucket].timestamps = _rl[bucket].timestamps.filter((t) => t > cutoff);
-}
-function _windowUsed(bucket) { _pruneWindow(bucket); return _rl[bucket].timestamps.length; }
-function _waitMs(bucket) {
-  _pruneWindow(bucket);
-  const { timestamps } = _rl[bucket];
-  const { max, windowMs } = RATE_LIMITS[bucket];
-  if (timestamps.length < max) return 0;
-  return Math.max(0, timestamps[0] + windowMs - Date.now() + 5);
-}
-function _recordCall(bucket) { _rl[bucket].timestamps.push(Date.now()); }
-
 // ─── Generic rate-limited fetch with exponential backoff ──────────────────────
 async function rateFetch(url, options = {}, providerId = "coinbase", bucket = "READ", _attempt = 0) {
   const provider = EXCHANGE_PROVIDERS[providerId];
