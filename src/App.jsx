@@ -184,33 +184,106 @@ function calcMACD(prices) {
   const e12 = calcEMA(prices, 12), e26 = calcEMA(prices, 26);
   return e12 && e26 ? e12 - e26 : null;
 }
+// ─── Signal generation ───────────────────────────────────────────────────────
+// Each indicator votes independently (+1 bull / -1 bear / 0 neutral).
+// Confidence = % of available indicators that AGREE with the action direction.
+// A BUY only fires when:
+//   1. Score > 2  (net bullish weight)
+//   2. At least MIN_AGREEING_INDICATORS indicators vote bullish
+//   3. Confidence >= the user-set threshold (checked in runTick)
+const MIN_AGREEING_INDICATORS = 3; // at least 3 of 5 must agree
+
 function generateSignal(indicators, newsSentiment, volumeRatio) {
-  let score = 0;
-  const reasons = [];
+  // Each entry: { weight, vote: +1 bull | -1 bear | 0 neutral, reason, active }
+  const signals = [];
+
+  // ── RSI (weight 2) ────────────────────────────────────────────────────────
   if (indicators.rsi !== null) {
-    if (indicators.rsi < 35) { score += 2; reasons.push(`RSI oversold (${indicators.rsi.toFixed(1)})`); }
-    else if (indicators.rsi > 65) { score -= 2; reasons.push(`RSI overbought (${indicators.rsi.toFixed(1)})`); }
-    else reasons.push(`RSI neutral (${indicators.rsi.toFixed(1)})`);
+    if (indicators.rsi < 35)
+      signals.push({ weight: 2, vote: 1,  label: `RSI oversold (${indicators.rsi.toFixed(1)})`, active: true });
+    else if (indicators.rsi > 65)
+      signals.push({ weight: 2, vote: -1, label: `RSI overbought (${indicators.rsi.toFixed(1)})`, active: true });
+    else
+      signals.push({ weight: 2, vote: 0,  label: `RSI neutral (${indicators.rsi.toFixed(1)})`, active: true });
   }
+
+  // ── SMA crossover (weight 1.5) ────────────────────────────────────────────
   if (indicators.sma20 && indicators.sma50) {
-    if (indicators.sma20 > indicators.sma50) { score += 1.5; reasons.push("SMA20 > SMA50 (bullish cross)"); }
-    else { score -= 1.5; reasons.push("SMA20 < SMA50 (bearish cross)"); }
+    if (indicators.sma20 > indicators.sma50)
+      signals.push({ weight: 1.5, vote: 1,  label: "SMA20 > SMA50 (bullish cross)", active: true });
+    else
+      signals.push({ weight: 1.5, vote: -1, label: "SMA20 < SMA50 (bearish cross)", active: true });
   }
+
+  // ── MACD (weight 1) ───────────────────────────────────────────────────────
   if (indicators.macd !== null) {
-    if (indicators.macd > 0) { score += 1; reasons.push(`MACD positive (${indicators.macd.toFixed(2)})`); }
-    else { score -= 1; reasons.push(`MACD negative (${indicators.macd.toFixed(2)})`); }
+    if (indicators.macd > 0)
+      signals.push({ weight: 1, vote: 1,  label: `MACD positive (${indicators.macd.toFixed(2)})`, active: true });
+    else
+      signals.push({ weight: 1, vote: -1, label: `MACD negative (${indicators.macd.toFixed(2)})`, active: true });
   }
+
+  // ── Bollinger Bands (weight 2) ────────────────────────────────────────────
   if (indicators.boll && indicators.currentPrice) {
-    if (indicators.currentPrice < indicators.boll.lower) { score += 2; reasons.push("Price below BB lower band"); }
-    else if (indicators.currentPrice > indicators.boll.upper) { score -= 2; reasons.push("Price above BB upper band"); }
+    if (indicators.currentPrice < indicators.boll.lower)
+      signals.push({ weight: 2, vote: 1,  label: "Price below BB lower band", active: true });
+    else if (indicators.currentPrice > indicators.boll.upper)
+      signals.push({ weight: 2, vote: -1, label: "Price above BB upper band", active: true });
+    else
+      signals.push({ weight: 2, vote: 0,  label: "Price inside BB bands", active: true });
   }
-  if (newsSentiment > 0.5) { score += 1.5; reasons.push(`Positive news (${(newsSentiment * 100).toFixed(0)}%)`); }
-  else if (newsSentiment < -0.3) { score -= 1.5; reasons.push(`Negative news (${(newsSentiment * 100).toFixed(0)}%)`); }
-  if (volumeRatio > 1.4) { score += Math.sign(score) * 1; reasons.push(`High volume (${volumeRatio.toFixed(2)}x avg)`); }
-  else if (volumeRatio < 0.7) { score *= 0.7; reasons.push(`Low volume (${volumeRatio.toFixed(2)}x avg)`); }
-  const action = score > 2 ? "BUY" : score < -2 ? "SELL" : "HOLD";
-  const confidence = Math.min(Math.abs(score) / 8 * 100, 97);
-  return { action, score: score.toFixed(2), confidence: confidence.toFixed(1), reasons };
+
+  // ── News sentiment (weight 1.5) ───────────────────────────────────────────
+  if (newsSentiment > 0.15)
+    signals.push({ weight: 1.5, vote: 1,  label: `Positive news sentiment (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
+  else if (newsSentiment < -0.15)
+    signals.push({ weight: 1.5, vote: -1, label: `Negative news sentiment (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
+  else
+    signals.push({ weight: 1.5, vote: 0,  label: `Neutral news (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
+
+  // ── Weighted score ────────────────────────────────────────────────────────
+  let score = signals.reduce((sum, s) => sum + s.vote * s.weight, 0);
+
+  // Volume multiplier — amplifies or dampens but cannot flip direction
+  let volumeNote = "";
+  if (volumeRatio > 1.4) {
+    score *= 1.2;
+    volumeNote = `High volume (${volumeRatio.toFixed(2)}x) — signal amplified`;
+  } else if (volumeRatio < 0.7) {
+    score *= 0.6;
+    volumeNote = `Low volume (${volumeRatio.toFixed(2)}x) — signal dampened`;
+  }
+
+  // ── Confidence: % of non-neutral indicators agreeing with net direction ───
+  // Only counts indicators with an actual vote (not 0)
+  const activeSignals = signals.filter((s) => s.vote !== 0);
+  const netDir = score > 0 ? 1 : -1;
+  const agreeing = activeSignals.filter((s) => s.vote === netDir);
+  // Confidence = (agreeing weight) / (total active weight) * 100
+  const totalActiveWeight = activeSignals.reduce((s, i) => s + i.weight, 0);
+  const agreeingWeight    = agreeing.reduce((s, i) => s + i.weight, 0);
+  const confidence = totalActiveWeight > 0
+    ? Math.min((agreeingWeight / totalActiveWeight) * 100, 99)
+    : 0;
+
+  // ── Action: BUY requires score threshold AND minimum agreeing indicators ──
+  const agreeingCount = agreeing.length;
+  let action = "HOLD";
+  if (score > 2 && agreeingCount >= MIN_AGREEING_INDICATORS) action = "BUY";
+
+  const reasons = [
+    ...signals.map((s) => ({ label: s.label, vote: s.vote })),
+    ...(volumeNote ? [{ label: volumeNote, vote: 0 }] : []),
+  ];
+
+  return {
+    action,
+    score: score.toFixed(2),
+    confidence: confidence.toFixed(1),
+    agreeingCount,
+    totalIndicators: activeSignals.length,
+    reasons,
+  };
 }
 
 // ─── Rate Limiter + Exponential Backoff ───────────────────────────────────────
@@ -1148,14 +1221,15 @@ export default function CryptoAlgoTrader() {
 
   // ── Execute a real trade on Coinbase ───────────────────────────────────────
   const executeRealTrade = useCallback(async (coin, action, price, confidence) => {
-    if (creds.sandbox) {
-      addAutoLog(`[SANDBOX] ${action} ${coin} @ $${price.toFixed(2)} (conf ${confidence}%)`, "sandbox");
-      return { success: true, sandbox: true };
-    }
-    const minConf = parseFloat(creds.minConfidence);
-    if (confidence < minConf) {
-      addAutoLog(`Skipped ${action} ${coin}: confidence ${confidence}% < threshold ${minConf}%`, "warn");
+    // Confidence gate applies to all modes including sandbox (exits are always 100%)
+    const minConf = parseFloat(creds.minConfidence) || 60;
+    if (action === "BUY" && confidence < minConf) {
+      addAutoLog(`Skipped BUY ${coin}: confidence ${confidence.toFixed(1)}% < threshold ${minConf}%`, "warn");
       return { success: false, reason: "low_confidence" };
+    }
+    if (creds.sandbox) {
+      addAutoLog(`[SANDBOX] ${action} ${coin} @ $${price.toFixed(2)} (conf ${confidence.toFixed(1)}%)`, "sandbox");
+      return { success: true, sandbox: true };
     }
     try {
       const tradeUSD = parseFloat(creds.tradeSizeUSD);
@@ -1263,8 +1337,10 @@ export default function CryptoAlgoTrader() {
       const shouldSell    = cs.position && (hitTakeProfit || hitStopLoss);
       const sellReason    = hitTakeProfit ? "TAKE_PROFIT" : hitStopLoss ? "STOP_LOSS" : null;
 
-      // ── BUY: signal-driven (indicators + sentiment + volume) ─────────────────
-      if (signal.action === "BUY" && !cs.position) {
+      // ── BUY: signal-driven, gated by confidence threshold ───────────────────
+      const minConf = parseFloat(creds.minConfidence) || 60;
+      const confPassed = parseFloat(signal.confidence) >= minConf;
+      if (signal.action === "BUY" && !cs.position && confPassed) {
         cs.position = { price: newPrice, size: 1, entryTick: tickRef.current };
         cs.trades++;
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
@@ -1294,6 +1370,8 @@ export default function CryptoAlgoTrader() {
         rsi: indicators.rsi, action: signal.action,
         confidence: parseFloat(signal.confidence),
         score: parseFloat(signal.score),
+        agreeingCount: signal.agreeingCount,
+        totalIndicators: signal.totalIndicators,
         volumeRatio, reasons: signal.reasons,
         pnl: cs.pnl + unrealized,
         exitTrigger,
@@ -1527,31 +1605,59 @@ export default function CryptoAlgoTrader() {
           <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10 }}>Current signal analysis</div>
           {lastH ? (
             <>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+              {/* Header row: action badge + confidence + score */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
                 <Badge action={lastH.action} />
-                <div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Confidence</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ width: 100, height: 5, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden" }}>
-                      <div style={{ width: lastH.confidence + "%", height: "100%", background: lastH.action === "BUY" ? "#10b981" : lastH.action === "SELL" ? "#ef4444" : "#f59e0b", borderRadius: 3 }} />
-                    </div>
-                    <span style={{ fontWeight: 600 }}>{lastH.confidence}%</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--color-text-secondary)", marginBottom: 3 }}>
+                    <span>Indicator agreement</span>
+                    <span style={{ fontWeight: 600, color: parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) ? "#10b981" : "#f59e0b" }}>
+                      {lastH.confidence}%
+                      {lastH.agreeingCount != null && ` (${lastH.agreeingCount}/${lastH.totalIndicators} agree)`}
+                    </span>
+                  </div>
+                  <div style={{ height: 6, background: "var(--color-border-tertiary)", borderRadius: 3, overflow: "hidden", position: "relative" }}>
+                    <div style={{ width: lastH.confidence + "%", height: "100%", borderRadius: 3,
+                      background: parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) ? "#10b981" : "#f59e0b",
+                      transition: "width 0.3s ease" }} />
+                    {/* Threshold marker */}
+                    <div style={{ position: "absolute", top: 0, left: creds.minConfidence + "%", width: 2, height: "100%", background: "#6366f1" }} />
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2, display: "flex", justifyContent: "space-between" }}>
+                    <span>threshold: {creds.minConfidence}% <span style={{ color: "#6366f1" }}>│</span></span>
+                    <span>score: <strong style={{ color: lastH.score > 0 ? "#10b981" : lastH.score < 0 ? "#ef4444" : "var(--color-text-secondary)" }}>{lastH.score > 0 ? "+" : ""}{lastH.score}</strong></span>
                   </div>
                 </div>
-                <div style={{ marginLeft: "auto", textAlign: "right" }}>
-                  <div style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>Score</div>
-                  <div style={{ fontWeight: 700, color: lastH.score > 0 ? "#10b981" : lastH.score < 0 ? "#ef4444" : "var(--color-text-secondary)" }}>{lastH.score > 0 ? "+" : ""}{lastH.score}</div>
-                </div>
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+
+              {/* Buy gate status */}
+              {lastH.action === "BUY" && lastH.agreeingCount != null && (
+                <div style={{ fontSize: 10, marginBottom: 8, padding: "4px 8px", borderRadius: 5,
+                  background: (parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3) ? "#d1fae5" : "#fef3c7",
+                  color: (parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3) ? "#065f46" : "#92400e" }}>
+                  {parseFloat(lastH.confidence) >= parseFloat(creds.minConfidence) && lastH.agreeingCount >= 3
+                    ? `✓ BUY gate passed — ${lastH.agreeingCount} indicators agree, confidence above threshold`
+                    : `⚠ BUY suppressed — ${parseFloat(lastH.confidence) < parseFloat(creds.minConfidence) ? `confidence ${lastH.confidence}% below ${creds.minConfidence}% threshold` : `only ${lastH.agreeingCount}/3 indicators agree`}`}
+                </div>
+              )}
+
+              {/* Per-indicator breakdown */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 {lastH.reasons.map((r, i) => {
-                  const up = r.includes("bullish") || r.includes("oversold") || r.includes("Positive") || r.includes("below");
-                  const neutral = r.includes("neutral") || r.includes("avg");
+                  const item = typeof r === "object" ? r : { label: r, vote: 0 };
+                  const voteColor = item.vote === 1 ? "#10b981" : item.vote === -1 ? "#ef4444" : "#94a3b8";
+                  const icon = item.vote === 1 ? "ti-arrow-up" : item.vote === -1 ? "ti-arrow-down" : "ti-minus";
                   return (
-                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
-                      <i className={`ti ${up ? "ti-arrow-up" : neutral ? "ti-minus" : "ti-arrow-down"}`} aria-hidden="true"
-                        style={{ color: up ? "#10b981" : neutral ? "#94a3b8" : "#ef4444", fontSize: 13 }} />
-                      <span style={{ color: "var(--color-text-secondary)" }}>{r}</span>
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11,
+                      padding: "3px 6px", borderRadius: 4,
+                      background: item.vote !== 0 ? voteColor + "11" : "transparent" }}>
+                      <i className={`ti ${icon}`} aria-hidden="true" style={{ color: voteColor, fontSize: 12, flexShrink: 0 }} />
+                      <span style={{ color: "var(--color-text-secondary)", flex: 1 }}>{item.label}</span>
+                      {item.vote !== 0 && (
+                        <span style={{ fontSize: 10, fontWeight: 600, color: voteColor }}>
+                          {item.vote === 1 ? "BULL" : "BEAR"}
+                        </span>
+                      )}
                     </div>
                   );
                 })}
