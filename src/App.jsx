@@ -1624,7 +1624,7 @@ function CryptoAlgoTrader() {
   // Both modes use fetchViaBridge which handles iframe/top-level detection.
   useEffect(() => {
     if (autoEnabled) {
-      const id = setInterval(() => fetchViaBridge(true, creds.provider), 2_000);
+      const id = setInterval(() => fetchViaBridge(true, creds.provider), 5_000);
       return () => clearInterval(id);
     }
     if (running) {
@@ -2029,11 +2029,12 @@ function CryptoAlgoTrader() {
       const sellReason    = hitTakeProfit ? "TAKE_PROFIT" : hitStopLoss ? "STOP_LOSS" : null;
 
       // ── BUY: signal-driven, gated by confidence threshold + warmup ────────────
-      const minConf = parseFloat(creds.minConfidence) || 60;
+      const minConf    = parseFloat(creds.minConfidence) || 60;
       const confPassed = parseFloat(signal.confidence) >= minConf;
-      const warmupDone = !autoEnabled || !liveStartRef.current ||
-        (Date.now() - liveStartRef.current) >= 5 * 60 * 1000;
-      if (signal.action === "BUY" && !cs.position && confPassed && warmupDone) {
+      // Use ref for warmup check — avoids stale closure bug with autoEnabled state
+      const inWarmup   = liveStartRef.current !== null &&
+        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE: place order first, only set position after confirmation
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
@@ -2044,15 +2045,16 @@ function CryptoAlgoTrader() {
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
               }
             });
-        } else {
-          // SIMULATION: set position immediately (no real order)
+        } else if (!autoEnabled) {
+          // SIMULATION ONLY: set position immediately (no real order)
+          // Never runs during live mode (autoEnabled=true), even during warmup
           cs.position = { price: newPrice, size: 1, entryTick: tickRef.current, sim: true };
           cs.trades++;
         }
       }
 
-      // ── SELL: exit rules only (take profit / stop loss) ───────────────────────
-      if (shouldSell) {
+      // ── SELL: exit rules only (take profit / stop loss) — also blocked during warmup ──
+      if (shouldSell && !inWarmup) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE: place order first, only clear position after confirmation
           const posAtSell = { ...cs.position };
