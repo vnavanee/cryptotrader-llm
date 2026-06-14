@@ -1567,11 +1567,18 @@ function CryptoAlgoTrader() {
   // ── Bootstrap on mount + re-fetch when provider changes ─────────────────────
   useEffect(() => { fetchViaBridge(false, creds.provider); }, [creds.provider]);
 
-  // ── Re-anchor every 15s ───────────────────────────────────────────────────────
+  // ── Price polling: 2s when automation live, 15s when idle ───────────────────
   useEffect(() => {
-    const id = setInterval(() => { if (!autoEnabled) fetchViaBridge(true, creds.provider); }, 15_000);
-    return () => clearInterval(id);
-  }, [autoEnabled, fetchViaBridge, creds.provider]);
+    if (autoEnabled) {
+      // Authenticated 2-second polling via proxy using active exchange
+      const id = setInterval(() => fetchLiveMarketData(), 2_000);
+      return () => clearInterval(id);
+    } else {
+      // Unauthenticated 15-second re-anchor via public proxy
+      const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
+      return () => clearInterval(id);
+    }
+  }, [autoEnabled, fetchViaBridge, fetchLiveMarketData, creds.provider]);
 
   // ── Poll rate-limit stats every 500ms ──────────────────────────────────────
   useEffect(() => {
@@ -1579,24 +1586,38 @@ function CryptoAlgoTrader() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Fetch live Coinbase prices + orderbook + candles ───────────────────────
+  // ── Fetch live prices via proxy — runs every 2s when automation is active ────
   const fetchLiveMarketData = useCallback(async () => {
-    const keys = creds.keys?.[creds.provider] || {};
-    const hasKeys = Object.values(keys).some(v => v && v.trim());
-    if (!hasKeys) return;
+    if (!PROXY_BASE) return;
     try {
-      const marketData = await exchangeGetMarketData(creds, creds.enabledCoins);
+      const coins  = creds.enabledCoins.join(",");
+      const url    = `${PROXY_BASE}?product=${coins}&exchange=${encodeURIComponent(creds.provider)}`;
+      const res    = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
+      const payload = await res.json();
+
       const s = stateRef.current;
-      for (const [coin, d] of Object.entries(marketData)) {
-        if (!d?.price || isNaN(d.price)) continue;
-        s[coin].prices.push(d.price);
+      let updated = false;
+      for (const coin of creds.enabledCoins) {
+        const d = payload?.data?.[coin];
+        const price = parseFloat(d?.price);
+        if (!d || isNaN(price) || price <= 0) continue;
+        s[coin].prices.push(price);
         if (s[coin].prices.length > 200) s[coin].prices.shift();
-        s[coin].volumes.push(Math.max(0.3, Math.random() * 0.5 + 0.75)); // volume proxy
+        // Derive volume proxy from bid/ask spread tightness
+        const spread = parseFloat(d.ask) - parseFloat(d.bid);
+        const vol = spread > 0 ? Math.max(0.3, 1 / spread) : 1;
+        s[coin].volumes.push(Math.min(vol, 3));
         if (s[coin].volumes.length > 200) s[coin].volumes.shift();
+        updated = true;
       }
-      setLiveData(prev => ({ ...prev, ...marketData }));
+      if (updated) {
+        setSnapshot(JSON.parse(JSON.stringify(s)));
+        setLiveData(prev => ({ ...prev, ...payload.data }));
+      }
     } catch (e) {
-      addAutoLog(`Market data error: ${e.message}`, "error");
+      // Suppress per-tick errors to avoid flooding the log — only log every 10th failure
+      if (Math.random() < 0.1) addAutoLog(`Price poll error: ${e.message}`, "error");
     }
   }, [creds, addAutoLog]);
 
@@ -1642,11 +1663,30 @@ function CryptoAlgoTrader() {
     try {
       const tradeUSD = parseFloat(creds.tradeSizeUSD);
       const baseSize = tradeUSD / price;
-      const result = await exchangePlaceOrder(creds, coin, action, tradeUSD, baseSize);
       const providerName = EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider;
-      addAutoLog(`✓ [${providerName}] ${action} ${coin} — ID: ${result.orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "success");
+      const keys = creds.keys?.[creds.provider] || {};
+
+      if (!PROXY_BASE) throw new Error("No proxy URL — set PROXY_BASE to your Cloud Run function URL");
+
+      // Route order through proxy to avoid CORS — keys sent over HTTPS, never stored
+      const res = await fetch(`${PROXY_BASE}/order`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          exchange:   creds.provider,
+          coin,
+          side:       action,
+          quoteSize:  tradeUSD,
+          baseSize,
+          ...keys,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      addAutoLog(`✓ [${providerName}] ${action} ${coin} — ID: ${data.orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "success");
       await fetchBalances();
-      return { success: true, orderId: result.orderId };
+      return { success: true, orderId: data.orderId };
     } catch (e) {
       addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
       return { success: false, error: e.message };
@@ -1689,8 +1729,7 @@ function CryptoAlgoTrader() {
 
     // News is fetched on a real interval — nothing to do per tick
 
-    // Fetch live market data every 5 ticks if automation is active
-    if (autoEnabled && tickRef.current % 5 === 0) fetchLiveMarketData();
+    // Price updates handled by dedicated 2s polling interval (see useEffect above)
 
     COINS.forEach((coin) => {
       const cs = s[coin];
@@ -2245,6 +2284,9 @@ function CryptoAlgoTrader() {
         <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current}</span>
         <span style={{ color: running ? "#10b981" : "#ef4444" }}><i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" /> {running ? "Algo running" : "Paused"}</span>
         <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
+        <span style={{ color: autoEnabled ? "#10b981" : "var(--color-text-secondary)" }}>
+          <i className="ti ti-refresh" aria-hidden="true" /> Price: {autoEnabled ? "every 2s" : "every 15s"}
+        </span>
         {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>SANDBOX MODE — no real orders</span>}
         <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
           P&L: {fmtPct(coin.pnl + unrealized)} ({coin.trades} trades)
