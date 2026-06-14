@@ -103,21 +103,24 @@ async function fetchPublicPriceDiag(productId) {
   }
 }
 
-// Batch fetch all coins via proxy — routes to the correct exchange
-// providerId: "coinbase" | "binance" | "kraken" | "gemini" | "alpaca" | "public"
-async function fetchAllPublicPrices(providerId = "coinbase") {
+// Batch fetch all coins via a single proxy call, return { prices, diags }
+async function fetchAllPublicPrices() {
   if (!PROXY_BASE) {
     const diags = {};
     for (const coin of COINS) {
-      diags[coin] = { price: null, ok: false, httpStatus: null, errorType: "no_proxy",
-        errorMsg: "No proxy URL configured — set PROXY_BASE to your Cloud Run function URL.", raw: null };
+      diags[coin] = {
+        price: null, ok: false, httpStatus: null,
+        errorType: "no_proxy",
+        errorMsg: "No proxy URL configured — set PROXY_BASE in the source to your Cloud Run function URL.",
+        raw: null,
+      };
     }
     return { prices: {}, diags };
   }
 
-  // Pass plain coin symbols — proxy normalises them per exchange internally
-  const coinList = COINS.join(",");
-  const url = `${PROXY_BASE}?product=${coinList}&exchange=${encodeURIComponent(providerId)}`;
+  // Single batched request: ?product=BTC-USD,ETH-USD,SOL-USD
+  const productList = COINS.map((c) => PRODUCT_IDS[c]).join(",");
+  const url = `${PROXY_BASE}?product=${productList}`;
   const diags = {};
   const prices = {};
 
@@ -128,7 +131,7 @@ async function fetchAllPublicPrices(providerId = "coinbase") {
     if (!res.ok) {
       for (const coin of COINS) {
         diags[coin] = { price: null, ok: false, httpStatus: res.status, errorType: "http",
-          errorMsg: `Proxy HTTP ${res.status} (${providerId})`, raw: text.slice(0, 200) };
+          errorMsg: `Proxy HTTP ${res.status}`, raw: text.slice(0, 200) };
       }
       return { prices, diags };
     }
@@ -139,21 +142,25 @@ async function fetchAllPublicPrices(providerId = "coinbase") {
       const coinData = payload?.data?.[coin];
       const price = parseFloat(coinData?.price);
       if (!coinData || isNaN(price)) {
-        diags[coin] = { price: null, ok: false, httpStatus: res.status, errorType: "empty",
-          errorMsg: payload?.errors?.[coin] || `${coin} missing from ${providerId} response`,
-          raw: text.slice(0, 200) };
+        diags[coin] = {
+          price: null, ok: false, httpStatus: res.status, errorType: "empty",
+          errorMsg: payload?.errors?.[coin] || `${coin} missing from proxy response`,
+          raw: text.slice(0, 200),
+        };
       } else {
         prices[coin] = price;
-        diags[coin] = { price, ok: true, httpStatus: res.status, errorType: null, errorMsg: null,
+        diags[coin] = {
+          price, ok: true, httpStatus: res.status, errorType: null, errorMsg: null,
           bid: parseFloat(coinData.bid) || null,
           ask: parseFloat(coinData.ask) || null,
           volume: parseFloat(coinData.volume) || null,
-          source: coinData.source || providerId };
+        };
       }
     }
   } catch (e) {
     const msg = e.message || String(e);
-    const errorType = msg.toLowerCase().includes("cors") || msg.toLowerCase().includes("failed to fetch") ? "cors" : "network";
+    const errorType = msg.toLowerCase().includes("cors") || msg.toLowerCase().includes("failed to fetch")
+      ? "cors" : "network";
     for (const coin of COINS) {
       diags[coin] = { price: null, ok: false, httpStatus: null, errorType, errorMsg: msg, raw: null };
     }
@@ -871,7 +878,7 @@ function MiniChart({ data }) {
 }
 
 // ─── Price Source Status Banner ──────────────────────────────────────────────
-function PriceSourceBanner({ status, onRetry, activeProvider }) {
+function PriceSourceBanner({ status, onRetry }) {
   const { fetching, ok, diags, lastSuccess, lastAttempt } = status;
 
   if (fetching && ok === null) {
@@ -888,7 +895,7 @@ function PriceSourceBanner({ status, onRetry, activeProvider }) {
     return (
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: 8, marginBottom: 10, background: "#d1fae5", border: "0.5px solid #10b981", fontSize: 11 }}>
         <span style={{ color: "#065f46", fontSize: 14 }}>✓</span>
-        <span style={{ color: "#065f46", fontWeight: 600 }}>Live prices synced from {activeProvider?.name || "exchange"}</span>
+        <span style={{ color: "#065f46", fontWeight: 600 }}>Live prices synced from Coinbase Exchange</span>
         {lastSuccess && <span style={{ color: "#065f46", opacity: 0.7 }}>— last sync {lastSuccess}</span>}
         {fetching && <span style={{ marginLeft: 4, color: "#065f46", opacity: 0.6 }}>syncing…</span>}
       </div>
@@ -1329,7 +1336,6 @@ function SettingsModal({ creds, onSave, onClose }) {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 function CryptoAlgoTrader() {
-  useEffect(() => { document.title = "Crypto Algo Trading Dashboard"; }, []);
   const [selectedCoin, setSelectedCoin] = useState("BTC");
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1500);
@@ -1471,22 +1477,23 @@ function CryptoAlgoTrader() {
   }, [fetchRealNews]);
 
   // ── Detect execution context ─────────────────────────────────────────────────
+  // inIframe = true  → running inside a sandboxed Claude artifact iframe
+  // inIframe = false → running as a top-level page (Vite, Netlify, CodeSandbox top frame)
   const inIframe = window !== window.parent;
 
   // ── Fetch prices: direct fetch when top-level, bridge when in iframe ──────────
-  // providerId is passed in so prices always come from the active exchange
-  const fetchViaBridge = useCallback((isAnchor = false, providerId = "coinbase") => {
+  const fetchViaBridge = useCallback((isAnchor = false) => {
     setPriceSourceStatus((p) => ({ ...p, fetching: true, lastAttempt: new Date().toLocaleTimeString() }));
 
     if (!inIframe) {
-      // Top-level page — fetch directly, no CSP restriction
-      fetchAllPublicPrices(providerId).then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
+      // Top-level page (Vite / Netlify / published app) — fetch directly, no CSP restriction
+      fetchAllPublicPrices().then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
       return;
     }
 
-    // Inside iframe — inject bridge script to bypass CSP
-    const coinList = COINS.join(",");
-    const url = `${PROXY_BASE}?product=${coinList}&exchange=${encodeURIComponent(providerId)}`;
+    // Inside iframe (Claude artifact) — inject bridge script into parent to bypass CSP
+    const productList = COINS.map((c) => PRODUCT_IDS[c]).join(",");
+    const url = `${PROXY_BASE}?product=${productList}`;
     try {
       const script = window.parent.document.createElement("script");
       script.id = "cbPriceBridge";
@@ -1506,7 +1513,8 @@ function CryptoAlgoTrader() {
       window.parent.document.getElementById("cbPriceBridge")?.remove();
       window.parent.document.body.appendChild(script);
     } catch (_) {
-      fetchAllPublicPrices(providerId).then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
+      // Cross-origin parent — fall back to direct fetch
+      fetchAllPublicPrices().then(({ prices, diags }) => applyPrices(prices, diags, isAnchor));
     }
   }, [inIframe]);
 
@@ -1564,14 +1572,14 @@ function CryptoAlgoTrader() {
     return () => window.removeEventListener("message", handler);
   }, [applyPrices]);
 
-  // ── Bootstrap on mount + re-fetch when provider changes ─────────────────────
-  useEffect(() => { fetchViaBridge(false, creds.provider); }, [creds.provider]);
+  // ── Bootstrap on mount ────────────────────────────────────────────────────────
+  useEffect(() => { fetchViaBridge(false); }, []);
 
   // ── Re-anchor every 15s ───────────────────────────────────────────────────────
   useEffect(() => {
-    const id = setInterval(() => { if (!autoEnabled) fetchViaBridge(true, creds.provider); }, 15_000);
+    const id = setInterval(() => { if (!autoEnabled) fetchViaBridge(true); }, 15_000);
     return () => clearInterval(id);
-  }, [autoEnabled, fetchViaBridge, creds.provider]);
+  }, [autoEnabled, fetchViaBridge]);
 
   // ── Poll rate-limit stats every 500ms ──────────────────────────────────────
   useEffect(() => {
@@ -1606,24 +1614,13 @@ function CryptoAlgoTrader() {
     const hasKeys = Object.values(keys).some(v => v && v.trim());
     if (!hasKeys) return;
     setCbError(null);
-    const providerName = EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider;
     try {
-      if (!PROXY_BASE) throw new Error("No proxy URL — set PROXY_BASE to your Cloud Run function URL");
-
-      // Balance fetches go through the proxy to avoid CORS — keys sent over HTTPS, never stored
-      const res = await fetch(`${PROXY_BASE}/balance`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ exchange: creds.provider, ...keys }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-
-      setCbBalances(data.balances);
-      addAutoLog(`[${providerName}] Balances — USD $${data.balances?.USD?.toFixed(2) ?? "?"}`, "success");
+      const balances = await exchangeGetBalances(creds);
+      setCbBalances(balances);
+      addAutoLog(`[${EXCHANGE_PROVIDERS[creds.provider]?.name}] Balances — USD $${balances.USD?.toFixed(2)}`, "success");
     } catch (e) {
       setCbError(e.message);
-      addAutoLog(`[${providerName}] Balance fetch failed: ${e.message}`, "error");
+      addAutoLog(`Balance fetch failed: ${e.message}`, "error");
     }
   }, [creds, addAutoLog]);
 
@@ -1662,7 +1659,7 @@ function CryptoAlgoTrader() {
       return;
     }
     setAutoStatus("connecting");
-    addAutoLog(`Connecting to ${EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider} API...`, "info");
+    addAutoLog("Connecting to Coinbase Advanced Trade API...", "info");
     try {
       await fetchBalances();
       await fetchLiveMarketData();
@@ -1825,7 +1822,7 @@ function CryptoAlgoTrader() {
   const statusLabel = { idle: "Automation idle", connecting: `Connecting to ${activeProvider.name}…`, live: creds.sandbox ? "Sandbox live" : `Live on ${activeProvider.name}`, error: "Connection error" }[autoStatus];
   const logTypeColor = { info: "var(--color-text-secondary)", success: "#10b981", error: "#ef4444", warn: "#f59e0b", sandbox: "#6366f1" };
 
-  const retryPriceFetch = useCallback(() => { fetchViaBridge(false, creds.provider); }, [fetchViaBridge, creds.provider]);
+  const retryPriceFetch = useCallback(() => { fetchViaBridge(false); }, [fetchViaBridge]);
 
   return (
     <div style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 13, color: "var(--color-text-primary)", padding: "12px 0" }}>
@@ -1948,7 +1945,7 @@ function CryptoAlgoTrader() {
       </div>
 
       {/* ── Rate Limit Monitor ───────────────────────────────────────────────── */}
-      <PriceSourceBanner status={priceSourceStatus} onRetry={retryPriceFetch} activeProvider={activeProvider} />
+      <PriceSourceBanner status={priceSourceStatus} onRetry={retryPriceFetch} />
       <RateLimitMonitor stats={rlStats} />
 
       {/* ── Ticker row ───────────────────────────────────────────────────────── */}
