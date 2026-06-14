@@ -1567,18 +1567,7 @@ function CryptoAlgoTrader() {
   // ── Bootstrap on mount + re-fetch when provider changes ─────────────────────
   useEffect(() => { fetchViaBridge(false, creds.provider); }, [creds.provider]);
 
-  // ── Price polling: 2s when automation live, 15s when idle ───────────────────
-  useEffect(() => {
-    if (autoEnabled) {
-      // Authenticated 2-second polling via proxy using active exchange
-      const id = setInterval(() => fetchLiveMarketData(), 2_000);
-      return () => clearInterval(id);
-    } else {
-      // Unauthenticated 15-second re-anchor via public proxy
-      const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
-      return () => clearInterval(id);
-    }
-  }, [autoEnabled, fetchViaBridge, fetchLiveMarketData, creds.provider]);
+
 
   // ── Poll rate-limit stats every 500ms ──────────────────────────────────────
   useEffect(() => {
@@ -1620,6 +1609,17 @@ function CryptoAlgoTrader() {
       if (Math.random() < 0.1) addAutoLog(`Price poll error: ${e.message}`, "error");
     }
   }, [creds, addAutoLog]);
+
+  // ── Price polling: 2s when automation live, 15s when idle ───────────────────
+  useEffect(() => {
+    if (autoEnabled) {
+      const id = setInterval(() => fetchLiveMarketData(), 2_000);
+      return () => clearInterval(id);
+    } else {
+      const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
+      return () => clearInterval(id);
+    }
+  }, [autoEnabled, fetchViaBridge, fetchLiveMarketData, creds.provider]);
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
   const fetchBalances = useCallback(async () => {
