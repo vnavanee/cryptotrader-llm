@@ -1896,25 +1896,33 @@ function CryptoAlgoTrader() {
       });
 
       // Reconcile local position state with exchange reality
+      // Skip adoption during warmup — pre-existing exchange balances are not algo positions
+      const inWarmupSync = liveStartRef.current !== null &&
+        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
+
       const s = stateRef.current;
       let reconciled = false;
       for (const coin of creds.enabledCoins) {
-        const exPos = data.positions?.[coin];
+        const exPos   = data.positions?.[coin];
         const localPos = s[coin].position;
 
-        if (exPos && exPos.qty > 0 && !localPos) {
-          // Exchange has a position we don't know about — adopt it
+        if (exPos && exPos.qty > 0 && !localPos && !inWarmupSync) {
+          // Exchange has a position the algo doesn't know about — adopt it
+          // (only after warmup so pre-existing balances aren't confused with algo positions)
           s[coin].position = {
-            price: exPos.entryPrice || s[coin].prices.at(-1),
-            size: exPos.qty,
-            entryTick: tickRef.current,
+            price:       exPos.entryPrice || s[coin].prices.at(-1),
+            size:        exPos.qty,
+            entryTick:   tickRef.current,
             fromExchange: true,
           };
           addAutoLog(`[SYNC] Adopted ${coin} position from exchange — qty: ${exPos.qty.toFixed(6)}`, "info");
           reconciled = true;
+        } else if (exPos && exPos.qty > 0 && !localPos && inWarmupSync) {
+          // During warmup — log that we see a balance but don't adopt it as a position
+          addAutoLog(`[SYNC] ${coin} balance on exchange (${exPos.qty.toFixed(6)}) — not adopted during warmup`, "info");
         } else if (!exPos?.qty && localPos?.fromExchange) {
           // Exchange closed a position we thought was open
-          const price = s[coin].prices.at(-1);
+          const price  = s[coin].prices.at(-1);
           const profit = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
           s[coin].pnl += profit;
           s[coin].position = null;
