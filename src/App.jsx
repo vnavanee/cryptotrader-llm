@@ -1357,6 +1357,9 @@ function CryptoAlgoTrader() {
     },
   });
   const [autoEnabled, setAutoEnabled] = useState(false);
+  const [manualBuying, setManualBuying]   = useState(false); // per-coin buy in progress
+  const [manualSelling, setManualSelling] = useState(false); // per-coin sell in progress
+  const [manualConfirm, setManualConfirm] = useState(null);  // { action, coin, price } pending confirm
   const [autoStatus, setAutoStatus] = useState("idle");
   const [autoLog, setAutoLog] = useState([]);
   const [cbBalances, setCbBalances] = useState(null);
@@ -1372,6 +1375,8 @@ function CryptoAlgoTrader() {
     ETH: { prices: [COIN_BASE.ETH], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
     SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
   });
+  // Latest live prices from 2s poller — read by runTick, written by fetchLiveMarketData
+  const livePriceRef = useRef({});
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -1521,6 +1526,8 @@ function CryptoAlgoTrader() {
           s[coin].prices = [prices[coin]];
           s[coin].volumes = [1];
         }
+        // Seed livePriceRef so runTick immediately uses real prices
+        livePriceRef.current[coin] = { price: prices[coin], bid: prices[coin], ask: prices[coin] };
       }
     }
     if (anyOk) setSnapshot(JSON.parse(JSON.stringify(s)));
@@ -1579,47 +1586,48 @@ function CryptoAlgoTrader() {
   const fetchLiveMarketData = useCallback(async () => {
     if (!PROXY_BASE) return;
     try {
-      const coins  = creds.enabledCoins.join(",");
-      const url    = `${PROXY_BASE}?product=${coins}&exchange=${encodeURIComponent(creds.provider)}`;
-      const res    = await fetch(url, { headers: { Accept: "application/json" } });
+      const coins = creds.enabledCoins.join(",");
+      const url   = `${PROXY_BASE}?product=${coins}&exchange=${encodeURIComponent(creds.provider)}`;
+      const res   = await fetch(url, { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
       const payload = await res.json();
 
-      const s = stateRef.current;
       let updated = false;
       for (const coin of creds.enabledCoins) {
-        const d = payload?.data?.[coin];
+        const d     = payload?.data?.[coin];
         const price = parseFloat(d?.price);
         if (!d || isNaN(price) || price <= 0) continue;
-        s[coin].prices.push(price);
-        if (s[coin].prices.length > 200) s[coin].prices.shift();
-        // Derive volume proxy from bid/ask spread tightness
-        const spread = parseFloat(d.ask) - parseFloat(d.bid);
-        const vol = spread > 0 ? Math.max(0.3, 1 / spread) : 1;
-        s[coin].volumes.push(Math.min(vol, 3));
-        if (s[coin].volumes.length > 200) s[coin].volumes.shift();
+        // Write fresh price into the ref — runTick picks it up on next tick
+        livePriceRef.current[coin] = {
+          price,
+          bid:    parseFloat(d.bid)    || price,
+          ask:    parseFloat(d.ask)    || price,
+          volume: parseFloat(d.volume) || null,
+        };
         updated = true;
       }
-      if (updated) {
-        setSnapshot(JSON.parse(JSON.stringify(s)));
-        setLiveData(prev => ({ ...prev, ...payload.data }));
-      }
+      if (updated) setLiveData(prev => ({ ...prev, ...payload.data }));
     } catch (e) {
-      // Suppress per-tick errors to avoid flooding the log — only log every 10th failure
       if (Math.random() < 0.1) addAutoLog(`Price poll error: ${e.message}`, "error");
     }
   }, [creds, addAutoLog]);
 
-  // ── Price polling: 2s when automation live, 15s when idle ───────────────────
+  // ── Price polling ────────────────────────────────────────────────────────────
+  // Live automation  → 2s via authenticated proxy (exchange prices)
+  // Simulate / idle  → 15s via public proxy (real prices anchor the simulation)
   useEffect(() => {
     if (autoEnabled) {
+      // 2-second authenticated polling
       const id = setInterval(() => fetchLiveMarketData(), 2_000);
       return () => clearInterval(id);
-    } else {
+    }
+    if (running) {
+      // Simulation running — still fetch real prices every 15s to anchor the random walk
       const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
       return () => clearInterval(id);
     }
-  }, [autoEnabled, fetchViaBridge, fetchLiveMarketData, creds.provider]);
+    // Stopped — no polling
+  }, [autoEnabled, running, fetchViaBridge, fetchLiveMarketData, creds.provider]);
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
   const fetchBalances = useCallback(async () => {
@@ -1708,6 +1716,7 @@ function CryptoAlgoTrader() {
       await fetchLiveMarketData();
       setAutoStatus("live");
       setAutoEnabled(true);
+      setRunning(true);
       addAutoLog(`Automation started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
     } catch (e) {
       setAutoStatus("error");
@@ -1716,9 +1725,140 @@ function CryptoAlgoTrader() {
     }
   }, [creds, fetchBalances, fetchLiveMarketData, addAutoLog]);
 
+  // ── Manual trade execution ────────────────────────────────────────────────
+  const executeManualTrade = useCallback(async (coin, action) => {
+    const price = stateRef.current[coin].prices.at(-1);
+    if (!price) return;
+    setManualConfirm(null);
+    action === "BUY" ? setManualBuying(true) : setManualSelling(true);
+
+    const s = stateRef.current[coin];
+    const tradeUSD = parseFloat(creds.tradeSizeUSD) || 50;
+    const baseSize = tradeUSD / price;
+
+    // Update local position state
+    if (action === "BUY" && !s.position) {
+      s.position = { price, size: 1, entryTick: tickRef.current, manual: true };
+      s.trades++;
+      addAutoLog(`[MANUAL] BUY ${coin} @ $${price.toFixed(2)}`, "info");
+    } else if (action === "SELL" && s.position) {
+      const profit = (price - s.position.price) / s.position.price * 100;
+      s.pnl += profit;
+      s.position = null;
+      s.trades++;
+      addAutoLog(`[MANUAL] SELL ${coin} @ $${price.toFixed(2)} → ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
+    } else if (action === "SELL" && !s.position) {
+      addAutoLog(`[MANUAL] SELL ignored — no open position for ${coin}`, "warn");
+      setManualSelling(false);
+      return;
+    } else if (action === "BUY" && s.position) {
+      addAutoLog(`[MANUAL] BUY ignored — position already open for ${coin}`, "warn");
+      setManualBuying(false);
+      return;
+    }
+
+    setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+
+    // Place real order if automation is live (goes through proxy)
+    if (autoEnabled && !creds.sandbox) {
+      try {
+        const keys = creds.keys?.[creds.provider] || {};
+        const res = await fetch(`${PROXY_BASE}/order`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ exchange: creds.provider, coin, side: action, quoteSize: tradeUSD, baseSize, ...keys }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        addAutoLog(`[MANUAL] ${action} ${coin} order confirmed — ID: ${data.orderId?.slice(0,12)}...`, "success");
+        await fetchBalances();
+      } catch (e) {
+        addAutoLog(`[MANUAL] ${action} ${coin} order failed: ${e.message}`, "error");
+      }
+    } else if (creds.sandbox) {
+      addAutoLog(`[MANUAL SANDBOX] ${action} ${coin} @ $${price.toFixed(2)}`, "sandbox");
+    }
+
+    action === "BUY" ? setManualBuying(false) : setManualSelling(false);
+  }, [creds, autoEnabled, addAutoLog]);
+
+  // ── Sync algo state from exchange (positions + fills) ────────────────────
+  const [exchangeState, setExchangeState] = useState(null); // { positions, fills, syncedAt }
+  const [syncing, setSyncing] = useState(false);
+
+  const syncFromExchange = useCallback(async () => {
+    if (!autoEnabled || !PROXY_BASE) return;
+    const keys = creds.keys?.[creds.provider] || {};
+    if (!Object.values(keys).some(v => v?.trim())) return;
+    setSyncing(true);
+    try {
+      const res = await fetch(`${PROXY_BASE}/positions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          exchange: creds.provider,
+          coins: creds.enabledCoins,
+          ...keys,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+      setExchangeState({
+        positions: data.positions || {},
+        fills:     data.fills     || [],
+        syncedAt:  new Date().toLocaleTimeString(),
+      });
+
+      // Reconcile local position state with exchange reality
+      const s = stateRef.current;
+      let reconciled = false;
+      for (const coin of creds.enabledCoins) {
+        const exPos = data.positions?.[coin];
+        const localPos = s[coin].position;
+
+        if (exPos && exPos.qty > 0 && !localPos) {
+          // Exchange has a position we don't know about — adopt it
+          s[coin].position = {
+            price: exPos.entryPrice || s[coin].prices.at(-1),
+            size: exPos.qty,
+            entryTick: tickRef.current,
+            fromExchange: true,
+          };
+          addAutoLog(`[SYNC] Adopted ${coin} position from exchange — qty: ${exPos.qty.toFixed(6)}`, "info");
+          reconciled = true;
+        } else if (!exPos?.qty && localPos?.fromExchange) {
+          // Exchange closed a position we thought was open
+          const price = s[coin].prices.at(-1);
+          const profit = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
+          s[coin].pnl += profit;
+          s[coin].position = null;
+          s[coin].trades++;
+          addAutoLog(`[SYNC] ${coin} position closed on exchange — P&L: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
+          reconciled = true;
+        }
+      }
+      if (reconciled) setSnapshot(JSON.parse(JSON.stringify(s)));
+
+    } catch (e) {
+      addAutoLog(`[SYNC] Exchange state sync failed: ${e.message}`, "error");
+    } finally {
+      setSyncing(false);
+    }
+  }, [autoEnabled, creds, addAutoLog]);
+
+  // Sync from exchange every 30s during live automation
+  useEffect(() => {
+    if (!autoEnabled) return;
+    syncFromExchange(); // immediate first sync
+    const id = setInterval(syncFromExchange, 30_000);
+    return () => clearInterval(id);
+  }, [autoEnabled, syncFromExchange]);
+
   const stopAutomation = useCallback(() => {
     setAutoEnabled(false);
     setAutoStatus("idle");
+    setRunning(false);
     addAutoLog("Automation stopped by user", "warn");
   }, [addAutoLog]);
 
@@ -1735,8 +1875,21 @@ function CryptoAlgoTrader() {
       const cs = s[coin];
       const lastPrice = cs.prices[cs.prices.length - 1];
 
-      // If not using live data for this coin, simulate
-      if (!autoEnabled || !creds.enabledCoins.includes(coin)) {
+      if (autoEnabled && creds.enabledCoins.includes(coin)) {
+        // Live mode — consume fresh price from livePriceRef (written by 2s poller)
+        const live = livePriceRef.current[coin];
+        if (live?.price && live.price > 0) {
+          cs.prices.push(live.price);
+          if (cs.prices.length > 200) cs.prices.shift();
+          // Derive volume from bid/ask spread
+          const spread = (live.ask || live.price) - (live.bid || live.price);
+          const vol = spread > 0 ? Math.max(0.3, Math.min(3, 1 / spread)) : 1;
+          cs.volumes.push(vol);
+          if (cs.volumes.length > 200) cs.volumes.shift();
+        }
+        // If no live price yet, keep last known price (don't simulate)
+      } else {
+        // Simulation mode — generate synthetic price movement
         const vol = coin === "SOL" ? 0.002 : coin === "ETH" ? 0.0016 : 0.0012;
         cs.prices.push(generatePrice(lastPrice, vol));
         if (cs.prices.length > 200) cs.prices.shift();
@@ -1917,14 +2070,9 @@ function CryptoAlgoTrader() {
         ))}
 
         <div style={{ display: "flex", gap: 6, marginLeft: "auto", alignItems: "center", flexWrap: "wrap" }}>
-          <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Speed</label>
+          <label style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>Algo speed</label>
           <input type="range" min="400" max="3000" step="200" value={speed} onChange={(e) => setSpeed(+e.target.value)} style={{ width: 70 }} />
           <span style={{ fontSize: 11, color: "var(--color-text-secondary)", minWidth: 32 }}>{(speed / 1000).toFixed(1)}s</span>
-
-          <button onClick={() => setRunning((r) => !r)}
-            style={{ padding: "5px 14px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: running ? "#fee2e2" : "#d1fae5", color: running ? "#991b1b" : "#065f46", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
-            <i className={`ti ${running ? "ti-player-pause" : "ti-player-play"}`} aria-hidden="true" /> {running ? "Pause" : "Start"}
-          </button>
 
           <button onClick={() => setShowSettings(true)}
             style={{ padding: "5px 14px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontFamily: "inherit", fontSize: 12, color: "var(--color-text-secondary)", display: "flex", alignItems: "center", gap: 5 }}>
@@ -1959,16 +2107,33 @@ function CryptoAlgoTrader() {
                 <i className="ti ti-refresh" aria-hidden="true" />
               </button>
             )}
-            {!autoEnabled ? (
-              <button onClick={startAutomation} disabled={!hasCredentials}
-                style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "var(--color-background-secondary)", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.5 }}>
-                <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start automation" : "Add credentials first"}
-              </button>
+            {!running ? (
+              <div style={{ display: "flex", gap: 6 }}>
+                {/* Simulation-only: no credentials needed */}
+                <button onClick={() => { setRunning(true); addAutoLog("Simulation started (no live trading)", "info"); }}
+                  style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
+                  <i className="ti ti-player-play" aria-hidden="true" /> Simulate
+                </button>
+                {/* Live automation: requires credentials */}
+                <button onClick={startAutomation} disabled={!hasCredentials}
+                  style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #10b981", background: hasCredentials ? "#d1fae5" : "transparent", color: hasCredentials ? "#065f46" : "var(--color-text-secondary)", cursor: hasCredentials ? "pointer" : "not-allowed", fontFamily: "inherit", fontWeight: 600, fontSize: 12, opacity: hasCredentials ? 1 : 0.4 }}>
+                  <i className="ti ti-robot" aria-hidden="true" /> {hasCredentials ? "Start live" : "No credentials"}
+                </button>
+              </div>
             ) : (
-              <button onClick={stopAutomation}
-                style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
-                <i className="ti ti-player-stop" aria-hidden="true" /> Stop automation
-              </button>
+              <div style={{ display: "flex", gap: 6 }}>
+                {/* Pause algo loop without stopping automation */}
+                {autoEnabled && (
+                  <button onClick={() => setRunning(r => !r)}
+                    style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "transparent", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
+                    <i className={`ti ${running ? "ti-player-pause" : "ti-player-play"}`} aria-hidden="true" /> {running ? "Pause" : "Resume"}
+                  </button>
+                )}
+                <button onClick={autoEnabled ? stopAutomation : () => { setRunning(false); addAutoLog("Simulation stopped", "info"); }}
+                  style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
+                  <i className="ti ti-player-stop" aria-hidden="true" /> {autoEnabled ? "Stop live" : "Stop sim"}
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -1982,6 +2147,60 @@ function CryptoAlgoTrader() {
                 <span style={{ color: logTypeColor[l.type] }}>{l.msg}</span>
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Exchange state sync panel */}
+        {autoEnabled && (
+          <div style={{ marginTop: 10, borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: "var(--color-text-secondary)", display: "flex", alignItems: "center", gap: 6 }}>
+                <i className="ti ti-refresh" aria-hidden="true" style={{ color: syncing ? "#f59e0b" : "#10b981" }} />
+                Exchange state {syncing ? "syncing…" : exchangeState ? `· synced ${exchangeState.syncedAt}` : "· not yet synced"}
+              </span>
+              <button onClick={syncFromExchange} disabled={syncing}
+                style={{ padding: "2px 8px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: syncing ? "not-allowed" : "pointer", fontSize: 10, color: "var(--color-text-secondary)", opacity: syncing ? 0.5 : 1 }}>
+                Sync now
+              </button>
+            </div>
+            {exchangeState && (
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                {/* Open positions from exchange */}
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 4 }}>Open positions on exchange</div>
+                  {Object.keys(exchangeState.positions).length === 0
+                    ? <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>None</div>
+                    : Object.entries(exchangeState.positions).map(([coin, p]) => (
+                      <div key={coin} style={{ fontSize: 10, display: "flex", gap: 8, marginBottom: 2 }}>
+                        <span style={{ color: COIN_COLORS[coin] || "var(--color-text-primary)", fontWeight: 600 }}>{coin}</span>
+                        <span style={{ color: "var(--color-text-secondary)" }}>qty: {p.qty?.toFixed(6)}</span>
+                        {p.entryPrice && <span style={{ color: "var(--color-text-secondary)" }}>@ ${fmt(p.entryPrice, 2)}</span>}
+                        {p.unrealizedPnl != null && (
+                          <span style={{ color: p.unrealizedPnl >= 0 ? "#10b981" : "#ef4444" }}>
+                            {p.unrealizedPnl >= 0 ? "+" : ""}${p.unrealizedPnl.toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+                    ))
+                  }
+                </div>
+                {/* Recent fills from exchange */}
+                <div style={{ flex: 1, minWidth: 180 }}>
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 4 }}>Recent fills</div>
+                  {exchangeState.fills.length === 0
+                    ? <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>None</div>
+                    : exchangeState.fills.slice(0, 5).map((f, i) => (
+                      <div key={i} style={{ fontSize: 10, display: "flex", gap: 6, marginBottom: 2 }}>
+                        <span style={{ color: f.side === "BUY" ? "#10b981" : "#ef4444", fontWeight: 600, minWidth: 28 }}>{f.side}</span>
+                        <span style={{ color: COIN_COLORS[f.coin] || "var(--color-text-primary)" }}>{f.coin}</span>
+                        <span style={{ color: "var(--color-text-secondary)" }}>${fmt(f.price, 2)}</span>
+                        <span style={{ color: "var(--color-text-tertiary)", marginLeft: "auto" }}>{f.time?.slice(11,16)}</span>
+                      </div>
+                    ))
+                  }
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -2153,40 +2372,104 @@ function CryptoAlgoTrader() {
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px", flex: 1 }}>
-            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8 }}>Position</div>
+
+          {/* ── Position panel ──────────────────────────────────────────────── */}
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${coin.position ? (unrealized >= 0 ? "#10b981" : "#ef4444") : "var(--color-border-tertiary)"}`, padding: "12px", flex: 1 }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
+              <span>Position — {selectedCoin}/USD</span>
+              {coin.position?.manual && <span style={{ fontSize: 10, color: "#f59e0b", fontWeight: 600 }}>MANUAL</span>}
+              {coin.position && !coin.position.manual && autoEnabled && <span style={{ fontSize: 10, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> AUTO</span>}
+            </div>
             {coin.position ? (() => {
               const er = creds.exitRules?.[selectedCoin] || {};
               const ep = coin.position.price;
               const resolveLevel = (type, val, dir) => {
-                const v = parseFloat(val) || 0;
-                if (!v) return null;
-                return type === "percent"
-                  ? dir === "up" ? ep * (1 + v / 100) : ep * (1 - v / 100)
-                  : dir === "up" ? ep + v : ep - v;
+                const v = parseFloat(val) || 0; if (!v) return null;
+                return type === "percent" ? dir === "up" ? ep*(1+v/100) : ep*(1-v/100) : dir === "up" ? ep+v : ep-v;
               };
               const tp = resolveLevel(er.takeProfitType, er.takeProfitValue, "up");
               const sl = resolveLevel(er.stopLossType, er.stopLossValue, "down");
-              return (
-                <>
-                  <div style={{ fontSize: 11, marginBottom: 3 }}>Entry: <strong>${fmt(ep, 2)}</strong></div>
-                  <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
-                  <div style={{ fontSize: 12, fontWeight: 600, color: unrealized >= 0 ? "#10b981" : "#ef4444", marginBottom: 6 }}>
-                    Unrealized: {fmtPct(unrealized)}
-                  </div>
-                  {tp && <div style={{ fontSize: 11, color: "#10b981", display: "flex", justifyContent: "space-between" }}>
-                    <span>↑ Take profit</span><strong>${fmt(tp, 2)}</strong>
-                  </div>}
-                  {sl && <div style={{ fontSize: 11, color: "#ef4444", display: "flex", justifyContent: "space-between" }}>
-                    <span>↓ Stop loss</span><strong>${fmt(sl, 2)}</strong>
-                  </div>}
-                  {autoEnabled && <div style={{ fontSize: 10, marginTop: 4, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> Managed by algo</div>}
-                </>
-              );
+              return (<>
+                <div style={{ fontSize: 11, marginBottom: 3 }}>Entry: <strong>${fmt(ep, 2)}</strong></div>
+                <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: unrealized >= 0 ? "#10b981" : "#ef4444", marginBottom: 6 }}>
+                  {fmtPct(unrealized)}
+                </div>
+                {tp && <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                  <span>↑ TP</span><strong>${fmt(tp, 2)}</strong>
+                </div>}
+                {sl && <div style={{ fontSize: 10, color: "#ef4444", display: "flex", justifyContent: "space-between" }}>
+                  <span>↓ SL</span><strong>${fmt(sl, 2)}</strong>
+                </div>}
+              </>);
             })() : (
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>No open position</div>
+              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>No open position</div>
             )}
           </div>
+
+          {/* ── Manual trade controls ───────────────────────────────────────── */}
+          <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span><i className="ti ti-hand-click" aria-hidden="true" /> Manual override</span>
+              <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>${fmt(currentPrice, selectedCoin === "BTC" ? 0 : 2)}</span>
+            </div>
+
+            {/* Confirm dialog */}
+            {manualConfirm && manualConfirm.coin === selectedCoin ? (
+              <div style={{ background: manualConfirm.action === "BUY" ? "#d1fae511" : "#fee2e211", border: `0.5px solid ${manualConfirm.action === "BUY" ? "#10b981" : "#ef4444"}`, borderRadius: 8, padding: "10px", marginBottom: 8 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: manualConfirm.action === "BUY" ? "#10b981" : "#ef4444" }}>
+                  Confirm {manualConfirm.action} {selectedCoin} @ ${fmt(manualConfirm.price, 2)}?
+                </div>
+                <div style={{ fontSize: 10, color: "var(--color-text-secondary)", marginBottom: 8 }}>
+                  Size: ${creds.tradeSizeUSD} {creds.sandbox ? "· SANDBOX" : autoEnabled ? "· LIVE ORDER" : "· sim only"}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => executeManualTrade(selectedCoin, manualConfirm.action)}
+                    style={{ flex: 1, padding: "6px", borderRadius: 6, border: "none", cursor: "pointer", fontWeight: 700, fontSize: 12,
+                      background: manualConfirm.action === "BUY" ? "#10b981" : "#ef4444", color: "#fff" }}>
+                    Confirm
+                  </button>
+                  <button onClick={() => setManualConfirm(null)}
+                    style={{ flex: 1, padding: "6px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", cursor: "pointer", fontSize: 12, background: "transparent", color: "var(--color-text-secondary)" }}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {/* BUY button */}
+                <button
+                  onClick={() => setManualConfirm({ action: "BUY", coin: selectedCoin, price: currentPrice })}
+                  disabled={!!coin.position || manualBuying}
+                  style={{ padding: "10px 0", borderRadius: 8, border: "0.5px solid #10b981",
+                    background: coin.position ? "transparent" : "#d1fae5",
+                    color: coin.position ? "#94a3b8" : "#065f46",
+                    cursor: coin.position ? "not-allowed" : "pointer",
+                    fontWeight: 700, fontSize: 13, opacity: coin.position ? 0.4 : 1 }}>
+                  {manualBuying ? "…" : "▲ BUY"}
+                </button>
+                {/* SELL button */}
+                <button
+                  onClick={() => setManualConfirm({ action: "SELL", coin: selectedCoin, price: currentPrice })}
+                  disabled={!coin.position || manualSelling}
+                  style={{ padding: "10px 0", borderRadius: 8, border: "0.5px solid #ef4444",
+                    background: !coin.position ? "transparent" : "#fee2e2",
+                    color: !coin.position ? "#94a3b8" : "#991b1b",
+                    cursor: !coin.position ? "not-allowed" : "pointer",
+                    fontWeight: 700, fontSize: 13, opacity: !coin.position ? 0.4 : 1 }}>
+                  {manualSelling ? "…" : "▼ SELL"}
+                </button>
+              </div>
+            )}
+
+            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 8, lineHeight: 1.4 }}>
+              {!autoEnabled ? "Start automation to place real orders" :
+               creds.sandbox ? "Sandbox — no real orders placed" :
+               `Live ${activeProvider.name} order · $${creds.tradeSizeUSD}`}
+            </div>
+          </div>
+
+          {/* ── Indicators ──────────────────────────────────────────────────── */}
           <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>Indicators</div>
             {lastH && (
@@ -2262,15 +2545,12 @@ function CryptoAlgoTrader() {
             {coin.history.slice(-12).reverse().map((h, i) => (
               <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, padding: "4px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                 <Badge action={h.action} />
-                {h.exitTrigger === "TAKE_PROFIT" && (
-                  <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TP ↑</span>
-                )}
-                {h.exitTrigger === "STOP_LOSS" && (
-                  <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>SL ↓</span>
-                )}
+                {h.manual && <span style={{ fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 5px", borderRadius: 4, fontWeight: 600 }}>M</span>}
+                {h.exitTrigger === "TAKE_PROFIT" && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TP ↑</span>}
+                {h.exitTrigger === "STOP_LOSS"   && <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>SL ↓</span>}
                 <span style={{ color: "var(--color-text-secondary)" }}>${fmt(h.price, selectedCoin === "BTC" ? 0 : 2)}</span>
                 <span style={{ marginLeft: "auto", color: "var(--color-text-tertiary)", fontSize: 10 }}>
-                  {h.exitTrigger ? h.exitTrigger.replace("_", " ") : `conf ${h.confidence}%`}
+                  {h.manual ? "manual" : h.exitTrigger ? h.exitTrigger.replace("_", " ") : `conf ${h.confidence}%`}
                 </span>
               </div>
             ))}
@@ -2282,7 +2562,10 @@ function CryptoAlgoTrader() {
       {/* ── Status bar ───────────────────────────────────────────────────────── */}
       <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", display: "flex", gap: 14, fontSize: 11, color: "var(--color-text-secondary)", flexWrap: "wrap", alignItems: "center" }}>
         <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current}</span>
-        <span style={{ color: running ? "#10b981" : "#ef4444" }}><i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" /> {running ? "Algo running" : "Paused"}</span>
+        <span style={{ color: running ? "#10b981" : "#ef4444" }}>
+          <i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" />
+          {running && autoEnabled ? "Live trading" : running ? "Simulating" : "Stopped"}
+        </span>
         <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
         <span style={{ color: autoEnabled ? "#10b981" : "var(--color-text-secondary)" }}>
           <i className="ti ti-refresh" aria-hidden="true" /> Price: {autoEnabled ? "every 2s" : "every 15s"}
