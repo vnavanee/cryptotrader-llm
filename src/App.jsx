@@ -1329,7 +1329,7 @@ function SettingsModal({ creds, onSave, onClose }) {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 function CryptoAlgoTrader() {
-  useEffect(() => { document.title = "Crypto Algo Trading Dashboard"; }, []);
+  useEffect(() => { document.title = "Crypto Trader"; }, []);
   const [selectedCoin, setSelectedCoin] = useState("BTC");
   const [running, setRunning] = useState(false);
   const [speed, setSpeed] = useState(1500);
@@ -1613,21 +1613,20 @@ function CryptoAlgoTrader() {
   }, [creds, addAutoLog]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
-  // Live automation  → 2s via authenticated proxy (exchange prices)
-  // Simulate / idle  → 15s via public proxy (real prices anchor the simulation)
+  // Live automation  → 5s  (real exchange prices via proxy, handles CORS via bridge)
+  // Simulate         → 15s (public prices to anchor the random walk)
+  // Stopped          → no polling
+  // Both modes use fetchViaBridge which handles iframe/top-level detection.
   useEffect(() => {
     if (autoEnabled) {
-      // 2-second authenticated polling
-      const id = setInterval(() => fetchLiveMarketData(), 2_000);
+      const id = setInterval(() => fetchViaBridge(true, creds.provider), 5_000);
       return () => clearInterval(id);
     }
     if (running) {
-      // Simulation running — still fetch real prices every 15s to anchor the random walk
       const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
       return () => clearInterval(id);
     }
-    // Stopped — no polling
-  }, [autoEnabled, running, fetchViaBridge, fetchLiveMarketData, creds.provider]);
+  }, [autoEnabled, running, fetchViaBridge, creds.provider]);
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
   const fetchBalances = useCallback(async () => {
@@ -1692,9 +1691,36 @@ function CryptoAlgoTrader() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-      addAutoLog(`✓ [${providerName}] ${action} ${coin} — ID: ${data.orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "success");
+      const orderId = data.orderId;
+      addAutoLog(`⏳ [${providerName}] ${action} ${coin} order placed — ID: ${orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "info");
+
+      // Poll for fill status (up to 10s, every 1s)
+      let filled = false;
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const provider = EXCHANGE_PROVIDERS[creds.provider];
+          const keys = creds.keys?.[creds.provider] || {};
+          const productId = provider.productId(coin);
+          const qs = new URLSearchParams({
+            exchange: creds.provider, orderId, productId, ...keys
+          }).toString();
+          const sRes = await fetch(`${PROXY_BASE}/orderstatus?${qs}`);
+          const sData = await sRes.json();
+          if (sData.done) {
+            const fillPrice = sData.price || price;
+            addAutoLog(`✓ [${providerName}] ${action} ${coin} FILLED @ $${fillPrice.toFixed(2)} — qty: ${sData.filled?.toFixed(6)}`, "success");
+            filled = true;
+            break;
+          } else {
+            addAutoLog(`⏳ [${providerName}] ${action} ${coin} status: ${sData.status} (${sData.filled?.toFixed(6)}/${sData.total?.toFixed(6)})`, "info");
+          }
+        } catch (_) { break; } // status check failed, proceed anyway
+      }
+      if (!filled) addAutoLog(`⚠ [${providerName}] ${action} ${coin} — could not confirm fill status`, "warn");
+
       await fetchBalances();
-      return { success: true, orderId: data.orderId };
+      return { success: true, orderId };
     } catch (e) {
       addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
       return { success: false, error: e.message };
@@ -1714,10 +1740,22 @@ function CryptoAlgoTrader() {
     try {
       await fetchBalances();
       await fetchLiveMarketData();
+      // Reset simulation state so sim positions don't bleed into live trading
+      const s = stateRef.current;
+      COINS.forEach(coin => {
+        s[coin].position = null;  // clear any sim position
+        s[coin].pnl      = 0;
+        s[coin].trades   = 0;
+        s[coin].history  = [];
+      });
+      livePriceRef.current = {};
+      tickRef.current = 0;
+      setSnapshot(JSON.parse(JSON.stringify(s)));
+
       setAutoStatus("live");
       setAutoEnabled(true);
       setRunning(true);
-      addAutoLog(`Automation started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
+      addAutoLog(`Live trading started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
     } catch (e) {
       setAutoStatus("error");
       setCbError(e.message);
@@ -1944,21 +1982,44 @@ function CryptoAlgoTrader() {
       const minConf = parseFloat(creds.minConfidence) || 60;
       const confPassed = parseFloat(signal.confidence) >= minConf;
       if (signal.action === "BUY" && !cs.position && confPassed) {
-        cs.position = { price: newPrice, size: 1, entryTick: tickRef.current };
-        cs.trades++;
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence));
+          // LIVE: place order first, only set position after confirmation
+          executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
+            .then(result => {
+              if (result?.success) {
+                stateRef.current[coin].position = { price: newPrice, size: 1, entryTick: tickRef.current, orderId: result.orderId };
+                stateRef.current[coin].trades++;
+                setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+              }
+            });
+        } else {
+          // SIMULATION: set position immediately (no real order)
+          cs.position = { price: newPrice, size: 1, entryTick: tickRef.current, sim: true };
+          cs.trades++;
         }
       }
 
       // ── SELL: exit rules only (take profit / stop loss) ───────────────────────
       if (shouldSell) {
-        const profit = (newPrice - cs.position.price) / cs.position.price * 100;
-        cs.pnl += profit;
-        cs.position = null;
-        cs.trades++;
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          executeRealTrade(coin, "SELL", newPrice, 100); // exit rules are always 100% confident
+          // LIVE: place order first, only clear position after confirmation
+          const posAtSell = { ...cs.position };
+          executeRealTrade(coin, "SELL", newPrice, 100)
+            .then(result => {
+              if (result?.success) {
+                const profit = (newPrice - posAtSell.price) / posAtSell.price * 100;
+                stateRef.current[coin].pnl += profit;
+                stateRef.current[coin].position = null;
+                stateRef.current[coin].trades++;
+                setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+              }
+            });
+        } else {
+          // SIMULATION: update immediately
+          const profit = (newPrice - cs.position.price) / cs.position.price * 100;
+          cs.pnl += profit;
+          cs.position = null;
+          cs.trades++;
         }
       }
 
@@ -2053,7 +2114,7 @@ function CryptoAlgoTrader() {
         }
         a { color: inherit; }
       `}</style>
-      <h2 className="sr-only">Crypto Algo Trading Dashboard with Coinbase Automation</h2>
+      <h2 className="sr-only">Crypto Trader</h2>
       {showSettings && <SettingsModal creds={creds} onSave={(f) => { setCreds(f); setShowSettings(false); addAutoLog("Credentials updated", "info"); }} onClose={() => setShowSettings(false)} />}
 
       {/* ── Top toolbar ──────────────────────────────────────────────────────── */}
@@ -2082,7 +2143,7 @@ function CryptoAlgoTrader() {
         </div>
       </div>
 
-      {/* ── Coinbase Automation Panel ─────────────────────────────────────────── */}
+      {/* ── Exchange Automation Panel ────────────────────────────────────────── */}
       <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${autoEnabled ? statusColor + "88" : "var(--color-border-tertiary)"}`, padding: "14px 16px", marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
