@@ -2159,8 +2159,9 @@ function CryptoAlgoTrader() {
           executeRealTrade(coin, "SELL", newPrice, 100, sellQty)
             .then(result => {
               if (result?.success) {
-                // Dollar P&L: size * (sellPrice - buyPrice)
-                const profit = (result.fillPrice || newPrice - posAtSell.price) * posAtSell.size;
+                // Dollar P&L: (sellFillPrice - buyEntryPrice) * qty
+                const actualSellPrice = result.fillPrice || newPrice;
+                const profit = (actualSellPrice - posAtSell.price) * posAtSell.size;
                 stateRef.current[coin].pnl    += profit;
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -2537,7 +2538,7 @@ function CryptoAlgoTrader() {
             </LineChart>
           </ResponsiveContainer>
           <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-            {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct((coin.pnl + unrealizedDollar) / parseFloat(creds.tradeSizeUSD || 50) * 100)}{")"}{" - "}{coin.trades}{" trades"}
+            {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" - "}{coin.trades}{" trades"}
           </div>
         </div>
       </div>
@@ -2733,6 +2734,24 @@ function CryptoAlgoTrader() {
         </div>
       </div>
 
+      {/* ── Trading log ──────────────────────────────────────────────────────── */}
+      {autoLog.length > 0 && (
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px", marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
+            <span><i className="ti ti-terminal-2" aria-hidden="true" /> Trading log</span>
+            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{autoLog.length} entries</span>
+          </div>
+          <div style={{ maxHeight: 140, overflowY: "auto", display: "flex", flexDirection: "column", gap: 3 }}>
+            {autoLog.slice(0, 20).map((l) => (
+              <div key={l.id} style={{ display: "flex", gap: 8, fontSize: 10, lineHeight: 1.5, borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 2 }}>
+                <span style={{ color: "var(--color-text-tertiary)", minWidth: 68, flexShrink: 0 }}>{l.time}</span>
+                <span style={{ color: logTypeColor[l.type] }}>{l.msg}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* ── News + Signal log ────────────────────────────────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
         <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
@@ -2829,7 +2848,7 @@ function CryptoAlgoTrader() {
         )}
         {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>{"SANDBOX MODE - no real orders"}</span>}
         <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-          {"P&L: $"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}{" "}{coin.trades}{" trades"}
+          {"P&L: $"}{(coin.pnl + unrealizedDollar) >= 0 ? "" : "-"}{"$"}{Math.abs(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}{" "}{coin.trades}{" trades"}
         </span>
       </div>
     </div>
