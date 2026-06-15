@@ -1382,6 +1382,9 @@ function CryptoAlgoTrader() {
   const liveStartRef = useRef(null);
   // Active orders: orderId → { coin, action, placedAt, timeout }
   const activeOrdersRef = useRef({});
+  // Per-coin pending flag — prevents duplicate orders while one is in flight
+  // { BTC: 'BUY' | 'SELL' | null, ETH: ..., SOL: ... }
+  const pendingRef = useRef({ BTC: null, ETH: null, SOL: null });
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -1781,10 +1784,11 @@ function CryptoAlgoTrader() {
         s[coin].trades   = 0;
         s[coin].history  = [];
       });
-      livePriceRef.current  = {};
+      livePriceRef.current    = {};
       activeOrdersRef.current = {};
-      tickRef.current       = 0;
-      liveStartRef.current  = Date.now();
+      pendingRef.current      = { BTC: null, ETH: null, SOL: null };
+      tickRef.current         = 0;
+      liveStartRef.current    = Date.now();
       setSnapshot(JSON.parse(JSON.stringify(s)));
       setWarmingUp(true);
 
@@ -1910,10 +1914,11 @@ function CryptoAlgoTrader() {
           // Exchange has a position the algo doesn't know about — adopt it
           // (only after warmup so pre-existing balances aren't confused with algo positions)
           s[coin].position = {
-            price:       exPos.entryPrice || s[coin].prices.at(-1),
-            size:        exPos.qty,
-            entryTick:   tickRef.current,
+            price:        exPos.entryPrice || s[coin].prices.at(-1),
+            size:         exPos.qty,
+            entryTick:    tickRef.current,
             fromExchange: true,
+            algoOwned:    false,  // exchange-synced — algo must not auto-sell
           };
           addAutoLog(`[SYNC] Adopted ${coin} position from exchange — qty: ${exPos.qty.toFixed(6)}`, "info");
           reconciled = true;
@@ -1953,8 +1958,9 @@ function CryptoAlgoTrader() {
     setAutoStatus("idle");
     setRunning(false);
     setWarmingUp(false);
-    liveStartRef.current  = null;
+    liveStartRef.current    = null;
     activeOrdersRef.current = {};
+    pendingRef.current      = { BTC: null, ETH: null, SOL: null };
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -2036,48 +2042,81 @@ function CryptoAlgoTrader() {
       const shouldSell    = cs.position && (hitTakeProfit || hitStopLoss);
       const sellReason    = hitTakeProfit ? "TAKE_PROFIT" : hitStopLoss ? "STOP_LOSS" : null;
 
-      // ── BUY: signal-driven, gated by confidence threshold + warmup ────────────
+      // ── Warmup check (ref-based — never stale) ───────────────────────────────
+      const inWarmup = liveStartRef.current !== null &&
+        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
+
+      // ── BUY: signal-driven ────────────────────────────────────────────────────
       const minConf    = parseFloat(creds.minConfidence) || 60;
       const confPassed = parseFloat(signal.confidence) >= minConf;
-      // Use ref for warmup check — avoids stale closure bug with autoEnabled state
-      const inWarmup   = liveStartRef.current !== null &&
-        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
-      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup) {
+      const noPending  = !pendingRef.current[coin]; // no order already in flight
+      // Only buy if: BUY signal, no position, confidence ok, warmup done, no pending order
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          // LIVE: place order first, only set position after confirmation
+          // LIVE — mark pending immediately to block duplicate orders
+          pendingRef.current[coin] = "BUY";
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
             .then(result => {
               if (result?.success) {
-                stateRef.current[coin].position = { price: newPrice, size: 1, entryTick: tickRef.current, orderId: result.orderId };
+                // Only set position if the order actually filled
+                stateRef.current[coin].position = {
+                  price: newPrice, size: 1,
+                  entryTick: tickRef.current,
+                  orderId: result.orderId,
+                  algoOwned: true,  // algo opened this — safe to algo-sell
+                };
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
               }
+            })
+            .finally(() => {
+              // Always clear pending flag so next signal can fire
+              pendingRef.current[coin] = null;
             });
         } else if (!autoEnabled) {
-          // SIMULATION ONLY: set position immediately (no real order)
-          // Never runs during live mode (autoEnabled=true), even during warmup
-          cs.position = { price: newPrice, size: 1, entryTick: tickRef.current, sim: true };
+          // SIMULATION only — never runs when autoEnabled=true
+          cs.position = { price: newPrice, size: 1, entryTick: tickRef.current, sim: true, algoOwned: true };
           cs.trades++;
         }
       }
 
-      // ── SELL: exit rules only (take profit / stop loss) — also blocked during warmup ──
-      if (shouldSell && !inWarmup) {
+      // ── SELL: exit rules only ─────────────────────────────────────────────────
+      // Guards:
+      //   1. Must not be in warmup
+      //   2. No pending order on this coin
+      //   3. Position must have been opened by the algo (algoOwned) — never sell
+      //      a pre-existing exchange balance or exchange-synced position
+      const canSell = shouldSell
+        && !inWarmup
+        && !pendingRef.current[coin]
+        && cs.position?.algoOwned === true;
+
+      if (canSell) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          // LIVE: place order first, only clear position after confirmation
+          // LIVE — mark pending and clear position optimistically to block duplicate sells
+          pendingRef.current[coin] = "SELL";
           const posAtSell = { ...cs.position };
+          // Clear position immediately in ref to prevent re-trigger on next tick
+          cs.position = null;
           executeRealTrade(coin, "SELL", newPrice, 100)
             .then(result => {
               if (result?.success) {
                 const profit = (newPrice - posAtSell.price) / posAtSell.price * 100;
-                stateRef.current[coin].pnl += profit;
-                stateRef.current[coin].position = null;
+                stateRef.current[coin].pnl    += profit;
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+              } else {
+                // Order failed — restore position so the algo can retry
+                stateRef.current[coin].position = posAtSell;
+                setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+                addAutoLog(`⚠ SELL ${coin} failed — position restored`, "error");
               }
+            })
+            .finally(() => {
+              pendingRef.current[coin] = null;
             });
         } else {
-          // SIMULATION: update immediately
+          // SIMULATION
           const profit = (newPrice - cs.position.price) / cs.position.price * 100;
           cs.pnl += profit;
           cs.position = null;
@@ -2506,8 +2545,9 @@ function CryptoAlgoTrader() {
           <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${coin.position ? (unrealized >= 0 ? "#10b981" : "#ef4444") : "var(--color-border-tertiary)"}`, padding: "12px", flex: 1 }}>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
               <span>Position — {selectedCoin}/USD</span>
-              {coin.position?.manual && <span style={{ fontSize: 10, color: "#f59e0b", fontWeight: 600 }}>MANUAL</span>}
-              {coin.position && !coin.position.manual && autoEnabled && <span style={{ fontSize: 10, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> AUTO</span>}
+              {coin.position?.manual      && <span style={{ fontSize: 10, color: "#f59e0b",  fontWeight: 600 }}>MANUAL</span>}
+              {coin.position?.fromExchange && <span style={{ fontSize: 10, color: "#94a3b8",  fontWeight: 600 }}>EXCHANGE BALANCE</span>}
+              {coin.position?.algoOwned && !coin.position.manual && autoEnabled && <span style={{ fontSize: 10, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> ALGO</span>}
             </div>
             {coin.position ? (() => {
               const er = creds.exitRules?.[selectedCoin] || {};
