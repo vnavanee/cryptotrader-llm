@@ -393,7 +393,7 @@ const EXCHANGE_PROVIDERS = {
       { key: "apiKey",    label: "API Key",    placeholder: "Your Binance.US API key",    type: "text",     hint: "From binance.us → API Management" },
       { key: "secretKey", label: "Secret Key", placeholder: "Your Binance.US secret key", type: "password", hint: "Never share this key" },
     ],
-    productId: (coin) => `${coin}-USD`,
+    productId: (coin) => `${coin}USD`,  // Binance.US format: BTCUSD, ETHUSD, SOLUSD
     rateLimit: { read: 1200, write: 100, windowMs: 60_000 },
   },
   kraken: {
