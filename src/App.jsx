@@ -393,7 +393,7 @@ const EXCHANGE_PROVIDERS = {
       { key: "apiKey",    label: "API Key",    placeholder: "Your Binance.US API key",    type: "text",     hint: "From binance.us → API Management" },
       { key: "secretKey", label: "Secret Key", placeholder: "Your Binance.US secret key", type: "password", hint: "Never share this key" },
     ],
-    productId: (coin) => `${coin}USDT`,
+    productId: (coin) => `${coin}-USD`,
     rateLimit: { read: 1200, write: 100, windowMs: 60_000 },
   },
   kraken: {
@@ -831,6 +831,17 @@ function getRateLimitStats() {
 }
 
 // ─── Utility formatters ────────────────────────────────────────────────────────
+// Binance LOT_SIZE step sizes (minimum quantity increments per coin)
+// https://api.binance.us/api/v3/exchangeInfo for exact values
+const LOT_STEPS = { BTC: 0.00001, ETH: 0.0001, SOL: 0.01 };
+function roundLotSize(qty, coin) {
+  const step = LOT_STEPS[coin] || 0.00001;
+  // Round DOWN to the nearest step to avoid exceeding available balance
+  const rounded = Math.floor(qty / step) * step;
+  // Return with enough decimal places to avoid scientific notation
+  return parseFloat(rounded.toFixed(8));
+}
+
 const fmt = (n, d = 2) => n?.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }) ?? "—";
 const fmtPct = (n) => (n >= 0 ? "+" : "") + n?.toFixed(2) + "%";
 
@@ -911,7 +922,7 @@ function PriceSourceBanner({ status, onRetry, activeProvider }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ color: "#ef4444", fontSize: 15 }}>⚠</span>
           <span style={{ color: "#991b1b", fontWeight: 600 }}>
-            Live price sync failed — showing simulated prices
+            {"Live price sync failed - showing simulated prices"}
           </span>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -939,7 +950,7 @@ function PriceSourceBanner({ status, onRetry, activeProvider }) {
                   <strong style={{ color: "#ef4444" }}>[{d.errorType?.toUpperCase()}]</strong>{" "}
                   {errorTypeLabels[d.errorType] || d.errorType}
                   {d.errorMsg && d.errorMsg !== errorTypeLabels[d.errorType] && (
-                    <span style={{ opacity: 0.7 }}> — {d.errorMsg}</span>
+                    <span style={{ opacity: 0.7 }}>{" - "}{d.errorMsg}</span>
                   )}
                   {d.httpStatus && <span style={{ opacity: 0.6 }}> (HTTP {d.httpStatus})</span>}
                   {d.raw && (
@@ -971,7 +982,7 @@ function PriceSourceBanner({ status, onRetry, activeProvider }) {
         )}
         {diags[COINS[0]]?.errorType === "network" && (
           <div style={{ opacity: 0.8 }}>
-            <strong>Network error:</strong> Proxy is unreachable — check the Vercel deployment is live and the URL is correct.
+            <strong>Network error:</strong>{" Proxy is unreachable - check the deployment URL is correct."}
           </div>
         )}
         {diags[COINS[0]]?.errorType === "http" && (
@@ -995,7 +1006,7 @@ function RateLimitMonitor({ stats }) {
   return (
     <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px 14px", marginBottom: 12 }}>
       <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
-        <i className="ti ti-activity" aria-hidden="true" /> API rate limits — 10-second rolling window
+        <i className="ti ti-activity" aria-hidden="true" />{" API rate limits - 10-second rolling window"}
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 10 }}>
         {[
@@ -1145,7 +1156,7 @@ function SettingsModal({ creds, onSave, onClose }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <div>
             <div style={{ fontWeight: 700, fontSize: 15 }}>Settings</div>
-            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>Exchange, credentials & trading rules</div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>{"Exchange, credentials & trading rules"}</div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: "var(--color-text-secondary)" }}>
             <i className="ti ti-x" aria-hidden="true" />
@@ -1203,7 +1214,7 @@ function SettingsModal({ creds, onSave, onClose }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", background: "var(--color-background-secondary)", padding: "8px 12px", borderRadius: 8 }}>
               Fill in credentials for any exchanges you want to use. Only the active exchange is used for trading.
-              Keys are stored in browser memory only — never sent to any server other than the exchange.
+              {"Keys are stored in browser memory only - never sent to any server other than the exchange."}
             </div>
             {Object.values(EXCHANGE_PROVIDERS).map(p => {
               const keys = form.keys[p.id] || {};
@@ -1259,7 +1270,7 @@ function SettingsModal({ creds, onSave, onClose }) {
               <input type="checkbox" checked={form.sandbox} onChange={e => set("sandbox", e.target.checked)} />
               <div>
                 <div style={{ fontWeight: 600, color: form.sandbox ? "#6366f1" : "var(--color-text-primary)" }}>Sandbox / paper-trading mode</div>
-                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>Simulates all orders — no real trades on any exchange</div>
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{"Simulates all orders - no real trades on any exchange"}</div>
               </div>
             </label>
           </div>
@@ -1385,6 +1396,12 @@ function CryptoAlgoTrader() {
   // Per-coin pending flag — prevents duplicate orders while one is in flight
   // { BTC: 'BUY' | 'SELL' | null, ETH: ..., SOL: ... }
   const pendingRef = useRef({ BTC: null, ETH: null, SOL: null });
+  // Per-coin order error counter — algo stops when any coin hits 3 consecutive errors
+  const orderErrorsRef = useRef({ BTC: 0, ETH: 0, SOL: 0 });
+  const MAX_ORDER_ERRORS = 3;
+  // Per-coin cooldown timestamp — no BUY within 1 minute of a confirmed SELL
+  const cooldownRef = useRef({ BTC: null, ETH: null, SOL: null });
+  const COOLDOWN_MS = 60_000; // 1 minute
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -1664,7 +1681,7 @@ function CryptoAlgoTrader() {
   }, [creds, addAutoLog]);
 
   // ── Execute a real trade on Coinbase ───────────────────────────────────────
-  const executeRealTrade = useCallback(async (coin, action, price, confidence) => {
+  const executeRealTrade = useCallback(async (coin, action, price, confidence, explicitBaseSize = null) => {
     // Confidence gate applies to all modes including sandbox (exits are always 100%)
     const minConf = parseFloat(creds.minConfidence) || 60;
     if (action === "BUY" && confidence < minConf) {
@@ -1677,7 +1694,9 @@ function CryptoAlgoTrader() {
     }
     try {
       const tradeUSD = parseFloat(creds.tradeSizeUSD);
-      const baseSize = tradeUSD / price;
+      const baseSize = explicitBaseSize !== null
+        ? roundLotSize(explicitBaseSize, coin)  // use actual filled qty for SELL
+        : tradeUSD / price;                      // estimate for BUY (exchange rounds to lot size)
       const providerName = EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider;
       const keys = creds.keys?.[creds.provider] || {};
 
@@ -1723,8 +1742,9 @@ function CryptoAlgoTrader() {
           const sData = await sRes.json();
           if (sData.done) {
             const fillPrice = parseFloat(sData.price) || price;
-            addAutoLog(`✓ [${providerName}] ${action} ${coin} FILLED @ $${fillPrice.toFixed(2)} qty: ${sData.filled?.toFixed(6) ?? "?"}`, "success");
-            filled = true;
+            const filledQty = parseFloat(sData.filled) || 0;
+            addAutoLog(`✓ [${providerName}] ${action} ${coin} FILLED @ $${fillPrice.toFixed(2)} qty: ${filledQty.toFixed(8)}`, "success");
+            filled = { price: fillPrice, qty: filledQty };
             break;
           }
           const elapsed = Math.round((Date.now() - activeOrdersRef.current[orderId].placedAt) / 1000);
@@ -1750,15 +1770,46 @@ function CryptoAlgoTrader() {
           addAutoLog(`⚠ [${providerName}] Cancel failed: ${e.message}`, "error");
         }
         delete activeOrdersRef.current[orderId];
+        // Timeout counts as an error toward the 3-strike limit
+        orderErrorsRef.current[coin] = (orderErrorsRef.current[coin] || 0) + 1;
+        const timeoutErrCount = orderErrorsRef.current[coin];
+        addAutoLog(`❌ BUY ${coin} timeout [${timeoutErrCount}/${MAX_ORDER_ERRORS}]`, "error");
+        if (timeoutErrCount >= MAX_ORDER_ERRORS) {
+          addAutoLog(`🛑 ${MAX_ORDER_ERRORS} consecutive failures on ${coin} — stopping automation`, "error");
+          setTimeout(() => {
+            setAutoEnabled(false);
+            setRunning(false);
+            setAutoStatus("error");
+            setCbError(`Stopped after ${MAX_ORDER_ERRORS} consecutive order timeouts on ${coin}`);
+          }, 0);
+        }
         return { success: false, reason: "timeout_cancelled", orderId };
       }
 
       if (!filled) addAutoLog(`⚠ [${providerName}] ${action} ${coin} — fill unconfirmed after 2 min`, "warn");
       delete activeOrdersRef.current[orderId];
+      orderErrorsRef.current[coin] = 0;
       await fetchBalances();
-      return { success: true, orderId, filled };
+      const fillData = filled || {};
+      return { success: true, orderId, filledQty: fillData.qty || null, fillPrice: fillData.price || price };
     } catch (e) {
-      addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
+      // Increment error counter
+      orderErrorsRef.current[coin] = (orderErrorsRef.current[coin] || 0) + 1;
+      const errCount = orderErrorsRef.current[coin];
+      addAutoLog(`❌ Order failed (${action} ${coin}) [${errCount}/${MAX_ORDER_ERRORS}]: ${e.message}`, "error");
+
+      if (errCount >= MAX_ORDER_ERRORS) {
+        // 3 consecutive errors — stop the algo to prevent runaway failures
+        addAutoLog(`🛑 ${MAX_ORDER_ERRORS} consecutive order errors on ${coin} — stopping automation`, "error");
+        // Use setTimeout to avoid calling setState inside an async callback chain
+        setTimeout(() => {
+          setAutoEnabled(false);
+          setRunning(false);
+          setAutoStatus("error");
+          setCbError(`Stopped after ${MAX_ORDER_ERRORS} consecutive order errors on ${coin}: ${e.message}`);
+        }, 0);
+      }
+
       return { success: false, error: e.message };
     }
   }, [creds, addAutoLog, fetchBalances]);
@@ -1787,6 +1838,8 @@ function CryptoAlgoTrader() {
       livePriceRef.current    = {};
       activeOrdersRef.current = {};
       pendingRef.current      = { BTC: null, ETH: null, SOL: null };
+      orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
+      cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
       tickRef.current         = 0;
       liveStartRef.current    = Date.now();
       setSnapshot(JSON.parse(JSON.stringify(s)));
@@ -1827,7 +1880,7 @@ function CryptoAlgoTrader() {
 
     // Update local position state
     if (action === "BUY" && !s.position) {
-      s.position = { price, size: 1, entryTick: tickRef.current, manual: true };
+      s.position = { price, size: roundLotSize(parseFloat(creds.tradeSizeUSD) / price, coin), entryTick: tickRef.current, manual: true, algoOwned: true };
       s.trades++;
       addAutoLog(`[MANUAL] BUY ${coin} @ $${price.toFixed(2)}`, "info");
     } else if (action === "SELL" && s.position) {
@@ -1953,6 +2006,8 @@ function CryptoAlgoTrader() {
     liveStartRef.current    = null;
     activeOrdersRef.current = {};
     pendingRef.current      = { BTC: null, ETH: null, SOL: null };
+    orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
+    cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -2042,8 +2097,11 @@ function CryptoAlgoTrader() {
       const minConf    = parseFloat(creds.minConfidence) || 60;
       const confPassed = parseFloat(signal.confidence) >= minConf;
       const noPending  = !pendingRef.current[coin]; // no order already in flight
-      // Only buy if: BUY signal, no position, confidence ok, warmup done, no pending order
-      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending) {
+      // Cooling off: block BUY for 1 minute after a confirmed SELL
+      const lastSell   = cooldownRef.current[coin];
+      const inCooldown = lastSell !== null && (Date.now() - lastSell) < COOLDOWN_MS;
+      // Only buy if: BUY signal, no position, confidence ok, warmup done, no pending, not cooling off
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE — log the signal and mark pending immediately
           addAutoLog(`🔔 BUY signal ${coin} @ $${newPrice.toFixed(2)} — conf ${signal.confidence}% score ${signal.score} — submitting order`, "info");
@@ -2051,12 +2109,14 @@ function CryptoAlgoTrader() {
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
             .then(result => {
               if (result?.success) {
-                // Only set position if the order actually filled
+                const entryPrice = result.fillPrice || newPrice;
+                const filledQty  = result.filledQty || (parseFloat(creds.tradeSizeUSD) / newPrice);
                 stateRef.current[coin].position = {
-                  price: newPrice, size: 1,
+                  price:     entryPrice,
+                  size:      filledQty,   // actual BTC/ETH/SOL quantity filled
                   entryTick: tickRef.current,
-                  orderId: result.orderId,
-                  algoOwned: true,  // algo opened this — safe to algo-sell
+                  orderId:   result.orderId,
+                  algoOwned: true,
                 };
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -2068,7 +2128,7 @@ function CryptoAlgoTrader() {
             });
         } else if (!autoEnabled) {
           // SIMULATION only — never runs when autoEnabled=true
-          cs.position = { price: newPrice, size: 1, entryTick: tickRef.current, sim: true, algoOwned: true };
+          cs.position = { price: newPrice, size: parseFloat(creds.tradeSizeUSD) / newPrice, entryTick: tickRef.current, sim: true, algoOwned: true };
           cs.trades++;
         }
       }
@@ -2092,13 +2152,18 @@ function CryptoAlgoTrader() {
           const posAtSell = { ...cs.position };
           // Clear position immediately in ref to prevent re-trigger on next tick
           cs.position = null;
-          executeRealTrade(coin, "SELL", newPrice, 100)
+          // Use actual filled quantity from BUY — avoids LOT_SIZE filter errors
+          const sellQty = posAtSell.size || (parseFloat(creds.tradeSizeUSD) / posAtSell.price);
+          executeRealTrade(coin, "SELL", newPrice, 100, sellQty)
             .then(result => {
               if (result?.success) {
                 const profit = (newPrice - posAtSell.price) / posAtSell.price * 100;
                 stateRef.current[coin].pnl    += profit;
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+                // Start 1-minute cooldown — no BUY until it expires
+                cooldownRef.current[coin] = Date.now();
+                addAutoLog(`⏸ ${coin} cooling off for 1 min — next BUY signal ignored until ${new Date(Date.now() + COOLDOWN_MS).toLocaleTimeString()}`, "info");
               } else {
                 // Order failed — restore position so the algo can retry
                 stateRef.current[coin].position = posAtSell;
@@ -2115,6 +2180,8 @@ function CryptoAlgoTrader() {
           cs.pnl += profit;
           cs.position = null;
           cs.trades++;
+          // Cooldown applies in simulation too
+          cooldownRef.current[coin] = Date.now();
         }
       }
 
@@ -2251,7 +2318,7 @@ function CryptoAlgoTrader() {
         {warmingUp && autoEnabled && (
           <span style={{ fontSize: 11, color: "#f59e0b", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-clock" aria-hidden="true" />
-            Warmup — collecting data, orders paused for 2 min
+            {"Warmup - collecting data, orders paused for 2 min"}
           </span>
         )}
 
@@ -2444,11 +2511,11 @@ function CryptoAlgoTrader() {
             </LineChart>
           </ResponsiveContainer>
           {lastH?.rsi && <div style={{ fontSize: 11, marginTop: 4, color: lastH.rsi > 70 ? "#ef4444" : lastH.rsi < 30 ? "#10b981" : "var(--color-text-secondary)" }}>
-            {lastH.rsi.toFixed(1)} — {lastH.rsi > 70 ? "Overbought" : lastH.rsi < 30 ? "Oversold" : "Neutral"}
+            {lastH.rsi.toFixed(1)}{" - "}{lastH.rsi > 70 ? "Overbought" : lastH.rsi < 30 ? "Oversold" : "Neutral"}
           </div>}
         </div>
         <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px" }}>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>Cumulative P&L (%)</div>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6 }}>{"Cumulative P&L (%)"}</div>
           <ResponsiveContainer width="100%" height={80}>
             <LineChart data={pnlData} margin={{ top: 2, right: 4, left: 0, bottom: 0 }}>
               <XAxis dataKey="i" hide />
@@ -2459,7 +2526,7 @@ function CryptoAlgoTrader() {
             </LineChart>
           </ResponsiveContainer>
           <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-            Total: {fmtPct(coin.pnl + unrealized)} — {coin.trades} trades
+            Total: {fmtPct(coin.pnl + unrealized)}{" - "}{coin.trades}{" trades"}
           </div>
         </div>
       </div>
@@ -2538,7 +2605,7 @@ function CryptoAlgoTrader() {
           {/* ── Position panel ──────────────────────────────────────────────── */}
           <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${coin.position ? (unrealized >= 0 ? "#10b981" : "#ef4444") : "var(--color-border-tertiary)"}`, padding: "12px", flex: 1 }}>
             <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
-              <span>Position — {selectedCoin}/USD</span>
+              <span>{"Position - "}{selectedCoin}{"/USD"}</span>
               {coin.position?.manual      && <span style={{ fontSize: 10, color: "#f59e0b",  fontWeight: 600 }}>MANUAL</span>}
               {coin.position?.fromExchange && <span style={{ fontSize: 10, color: "#94a3b8",  fontWeight: 600 }}>EXCHANGE BALANCE</span>}
               {coin.position?.algoOwned && !coin.position.manual && autoEnabled && <span style={{ fontSize: 10, color: "#6366f1" }}><i className="ti ti-robot" aria-hidden="true" /> ALGO</span>}
@@ -2554,6 +2621,7 @@ function CryptoAlgoTrader() {
               const sl = resolveLevel(er.stopLossType, er.stopLossValue, "down");
               return (<>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Entry: <strong>${fmt(ep, 2)}</strong></div>
+                <div style={{ fontSize: 11, marginBottom: 3 }}>Qty: <strong>{(coin.position.size || 0).toFixed(8)} {selectedCoin}</strong></div>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: unrealized >= 0 ? "#10b981" : "#ef4444", marginBottom: 6 }}>
                   {fmtPct(unrealized)}
@@ -2625,6 +2693,13 @@ function CryptoAlgoTrader() {
               </div>
             )}
 
+            {(cooldownRef.current[selectedCoin] &&
+              Math.max(0, Math.ceil((cooldownRef.current[selectedCoin] + COOLDOWN_MS - Date.now()) / 1000)) > 0
+            ) && (
+              <div style={{ marginTop: 6, padding: "5px 8px", borderRadius: 5, background: "#fef3c711", border: "0.5px solid #f59e0b", fontSize: 10, color: "#f59e0b" }}>
+                {"⏸ Cooling off - next BUY in " + Math.max(0, Math.ceil((cooldownRef.current[selectedCoin] + COOLDOWN_MS - Date.now()) / 1000)) + "s"}
+              </div>
+            )}
             <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 8, lineHeight: 1.4 }}>
               {!autoEnabled ? "Start automation to place real orders" :
                creds.sandbox ? "Sandbox — no real orders placed" :
@@ -2731,11 +2806,19 @@ function CryptoAlgoTrader() {
         </span>
         <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
         <span style={{ color: autoEnabled ? "#10b981" : "var(--color-text-secondary)" }}>
-          <i className="ti ti-refresh" aria-hidden="true" /> Price: {autoEnabled ? "every 2s" : "every 15s"}
+          <i className="ti ti-refresh" aria-hidden="true" /> Price: {autoEnabled ? "every 5s" : "every 15s"}
         </span>
-        {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>SANDBOX MODE — no real orders</span>}
+        {autoEnabled && COINS.some(c => orderErrorsRef.current[c] > 0) && (
+          <span style={{ color: "#f59e0b" }}>
+            <i className="ti ti-alert-triangle" aria-hidden="true" /> Order errors:{" "}
+            {COINS.filter(c => orderErrorsRef.current[c] > 0)
+              .map(c => `${c}: ${orderErrorsRef.current[c]}/${MAX_ORDER_ERRORS}`)
+              .join(" · ")}
+          </span>
+        )}
+        {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>{"SANDBOX MODE - no real orders"}</span>}
         <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-          P&L: {fmtPct(coin.pnl + unrealized)} ({coin.trades} trades)
+          {"P&L: "}{fmtPct(coin.pnl + unrealized)}{" ("}{coin.trades}{" trades)"}
         </span>
       </div>
     </div>
