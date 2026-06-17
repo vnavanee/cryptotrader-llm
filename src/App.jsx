@@ -1104,7 +1104,6 @@ function RateLimitMonitor({ stats }) {
         )}
       </div>
     </div>
-  
   );
 }
 
@@ -1972,11 +1971,11 @@ function CryptoAlgoTrader() {
     livePriceRef.current[coin] = { price, bid: bid || price, ask: ask || price };
   }, []);
 
-  // Activate WebSocket when automation is live
+  // Activate WebSocket when running (simulation or live)
   useWebSocketPrices(
     creds.provider,
     creds.enabledCoins,
-    wsEnabled && autoEnabled,
+    wsEnabled && running,   // active in both sim and live mode
     handleWsPrice,
     setWsStatus,
   );
@@ -2231,21 +2230,21 @@ function CryptoAlgoTrader() {
   }, [creds, addAutoLog]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
-  // Live + WS connected → no HTTP polling (WS provides per-second updates)
-  // Live + WS off/failed → 5s HTTP poll via proxy
-  // Simulate            → 15s HTTP poll to anchor random walk to real prices
-  // Stopped             → no polling
+  // WS connected (sim or live) → no HTTP polling
+  // Live + WS off/failed       → 5s HTTP fallback
+  // Simulate + WS off/failed   → 15s HTTP anchor
+  // Stopped                    → no polling
   useEffect(() => {
-    if (autoEnabled && wsStatus !== "connected") {
-      // HTTP fallback when WS is off or failed
+    if (!running) return; // stopped — no polling at all
+    if (wsStatus === "connected") return; // WS active — no HTTP needed
+    if (autoEnabled) {
+      // Live mode, WS not connected — 5s HTTP fallback
       const id = setInterval(() => fetchViaBridge(true, creds.provider), 5_000);
       return () => clearInterval(id);
     }
-    if (running && !autoEnabled) {
-      // Simulation mode — 15s anchor
-      const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
-      return () => clearInterval(id);
-    }
+    // Simulation mode, WS not connected — 15s HTTP anchor
+    const id = setInterval(() => fetchViaBridge(true, creds.provider), 15_000);
+    return () => clearInterval(id);
   }, [autoEnabled, running, wsStatus, fetchViaBridge, creds.provider]);
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
@@ -3073,7 +3072,7 @@ function CryptoAlgoTrader() {
             {!running ? (
               <div style={{ display: "flex", gap: 6 }}>
                 {/* Simulation-only: no credentials needed */}
-                <button onClick={() => { setRunning(true); addAutoLog("Simulation started (no live trading)", "info"); }}
+                <button onClick={() => { setWsEnabled(true); setRunning(true); addAutoLog("Simulation started - WS price feed activating", "info"); }}
                   style={{ padding: "6px 14px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
                   <i className="ti ti-player-play" aria-hidden="true" /> Simulate
                 </button>
@@ -3092,7 +3091,7 @@ function CryptoAlgoTrader() {
                     <i className={`ti ${running ? "ti-player-pause" : "ti-player-play"}`} aria-hidden="true" /> {running ? "Pause" : "Resume"}
                   </button>
                 )}
-                <button onClick={autoEnabled ? stopAutomation : () => { setRunning(false); addAutoLog("Simulation stopped", "info"); }}
+                <button onClick={autoEnabled ? stopAutomation : () => { setWsEnabled(false); setRunning(false); addAutoLog("Simulation stopped", "info"); }}
                   style={{ padding: "6px 16px", borderRadius: 7, border: "0.5px solid #ef4444", background: "#fee2e2", color: "#991b1b", cursor: "pointer", fontFamily: "inherit", fontWeight: 600, fontSize: 12 }}>
                   <i className="ti ti-player-stop" aria-hidden="true" /> {autoEnabled ? "Stop live" : "Stop sim"}
                 </button>
@@ -3606,7 +3605,7 @@ function CryptoAlgoTrader() {
             boxShadow: wsStatus === "connected" ? "0 0 5px #10b981" : "none",
           }} />
           <span style={{ fontSize: 11, color: wsStatus === "connected" ? "#10b981" : "var(--color-text-secondary)" }}>
-            {wsStatus === "connected" ? "WS live" : wsStatus === "idle" ? "WS off" : `WS: ${wsStatus}`}
+            {wsStatus === "connected" ? (autoEnabled ? "WS live" : "WS sim") : wsStatus === "idle" ? "WS off" : `WS: ${wsStatus}`}
           </span>
           {autoEnabled && (
             <button onClick={() => setWsEnabled(w => !w)}
@@ -3614,12 +3613,12 @@ function CryptoAlgoTrader() {
                 border: `0.5px solid ${wsEnabled ? "#10b981" : "var(--color-border-secondary)"}`,
                 background: wsEnabled ? "#d1fae5" : "transparent",
                 color: wsEnabled ? "#065f46" : "var(--color-text-secondary)" }}>
-              {wsEnabled ? "On" : "Off"}
+              {wsEnabled ? (wsStatus === "connected" ? "Live" : "Connecting...") : "Off"}
             </button>
           )}
         </span>
         <span style={{ color: autoEnabled && !wsEnabled ? "#10b981" : "var(--color-text-secondary)" }}>
-          <i className="ti ti-refresh" aria-hidden="true" /> HTTP: {autoEnabled && !wsEnabled ? "every 5s" : wsEnabled ? "standby" : "every 15s"}
+          <i className="ti ti-refresh" aria-hidden="true" /> HTTP: {wsStatus === "connected" ? "standby" : autoEnabled ? "every 5s" : running ? "every 15s" : "off"}
         </span>
         {autoEnabled && COINS.some(c => orderErrorsRef.current[c] > 0) && (
           <span style={{ color: "#f59e0b" }}>
@@ -3635,7 +3634,6 @@ function CryptoAlgoTrader() {
         </span>
       </div>
     </div>
-  
   );
 }
 
