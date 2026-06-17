@@ -167,10 +167,6 @@ const CB_API_BASE = "https://api.coinbase.com/api/v3/brokerage";
 const NEWS_PROXY_URL = `${PROXY_BASE}/news`;
 
 // ─── Technical Indicators ─────────────────────────────────────────────────────
-function generatePrice(prev, volatility = 0.0015) {
-  const change = (Math.random() - 0.499) * volatility * prev;
-  return Math.max(prev + change, prev * 0.97);
-}
 function calcSMA(prices, period) {
   if (prices.length < period) return null;
   return prices.slice(-period).reduce((a, b) => a + b, 0) / period;
@@ -2662,28 +2658,19 @@ function CryptoAlgoTrader() {
       const cs = s[coin];
       const lastPrice = cs.prices[cs.prices.length - 1];
 
-      if (autoEnabled && creds.enabledCoins.includes(coin)) {
-        // Live mode — consume fresh price from livePriceRef (written by 2s poller)
-        const live = livePriceRef.current[coin];
-        if (live?.price && live.price > 0) {
-          cs.prices.push(live.price);
-          if (cs.prices.length > 200) cs.prices.shift();
-          // Derive volume from bid/ask spread
-          const spread = (live.ask || live.price) - (live.bid || live.price);
-          const vol = spread > 0 ? Math.max(0.3, Math.min(3, 1 / spread)) : 1;
-          cs.volumes.push(vol);
-          if (cs.volumes.length > 200) cs.volumes.shift();
-        }
-        // If no live price yet, keep last known price (don't simulate)
-      } else {
-        // Simulation mode — generate synthetic price movement
-        const vol = coin === "SOL" ? 0.002 : coin === "ETH" ? 0.0016 : 0.0012;
-        cs.prices.push(generatePrice(lastPrice, vol));
+      // Both live and simulation: consume real prices from livePriceRef
+      // livePriceRef is written by WebSocket (primary) or HTTP poller (fallback)
+      // No synthetic price generation — simulation uses real market data only
+      const live = livePriceRef.current[coin];
+      if (live?.price && live.price > 0) {
+        cs.prices.push(live.price);
         if (cs.prices.length > 200) cs.prices.shift();
-        const lv = cs.volumes[cs.volumes.length - 1];
-        cs.volumes.push(Math.max(0.3, lv + (Math.random() - 0.48) * 0.3));
+        const spread = (live.ask || live.price) - (live.bid || live.price);
+        const vol = spread > 0 ? Math.max(0.3, Math.min(3, 1 / spread)) : 1;
+        cs.volumes.push(vol);
         if (cs.volumes.length > 200) cs.volumes.shift();
       }
+      // If no live price yet — hold last known price, do not generate synthetic data
 
       const newPrice = cs.prices[cs.prices.length - 1];
       const avgVol = cs.volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(cs.volumes.length, 20);
