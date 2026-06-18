@@ -3413,10 +3413,11 @@ function CryptoAlgoTrader() {
                 {/* Trailing take-profit status */}
                 {creds.exitStrategies?.trailingTakeProfit?.enabled && coin.position && (() => {
                   const ttp = trailingTpRef.current[selectedCoin];
-                  const tpPrice = coin.position.price && exitRule.takeProfitValue
-                    ? exitRule.takeProfitType === "percent"
-                      ? coin.position.price * (1 + parseFloat(exitRule.takeProfitValue) / 100)
-                      : coin.position.price + parseFloat(exitRule.takeProfitValue)
+                  const er = creds.exitRules?.[selectedCoin] || {};
+                  const tpPrice = coin.position.price && er.takeProfitValue
+                    ? er.takeProfitType === "percent"
+                      ? coin.position.price * (1 + parseFloat(er.takeProfitValue) / 100)
+                      : coin.position.price + parseFloat(er.takeProfitValue)
                     : null;
                   if (ttp?.armed) {
                     const reversalPx = ttp.peak * (1 - (parseFloat(creds.exitStrategies.trailingTakeProfit.trailPercent) || 1) / 100);
