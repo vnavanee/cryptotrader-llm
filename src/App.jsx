@@ -1561,10 +1561,10 @@ function SettingsModal({ creds, onSave, onClose }) {
                   <input type="checkbox" checked={!!form.agentMode} onChange={e => set("agentMode", e.target.checked)} />
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: form.agentMode ? "#6366f1" : "var(--color-text-primary)" }}>
-                      {"🤖 LLM Agent mode (Claude claude-sonnet-4-6)"}
+                      {"🤖 LLM Agent mode (DeepSeek-V3)"}
                     </div>
                     <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 3 }}>
-                      Replaces rule-based signals with Claude AI. The agent receives all indicator values, position state,
+                      Replaces rule-based signals with DeepSeek AI. The agent receives all indicator values, position state,
                       news sentiment and settings, then reasons through a BUY/SELL/HOLD decision with explanation.
                     </div>
                   </div>
@@ -1582,7 +1582,7 @@ function SettingsModal({ creds, onSave, onClose }) {
                     <input type="number" value={form.agentIntervalSec} onChange={e => set("agentIntervalSec", e.target.value)}
                       min="10" max="300" step="5" style={{ width: "100%", boxSizing: "border-box" }} />
                     <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
-                      Claude called every {form.agentIntervalSec}s per coin. Rule-based used as fallback while thinking.
+                      DeepSeek called every {form.agentIntervalSec}s per coin. Rule-based used as fallback while thinking.
                     </div>
                   </label>
                 </div>
@@ -1858,22 +1858,26 @@ Respond ONLY with valid JSON in this exact format, no other text:
   "suggestedSlAdjust": null | "<+X% or -X%>"
 }`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  // Route through Cloud Run proxy — API key lives on the server, never in browser
+  if (!PROXY_BASE) throw new Error("PROXY_BASE not set — cannot reach agent endpoint");
+  const response = await fetch(`${PROXY_BASE}/agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 512,
-      messages: [{ role: "user", content: prompt }],
-    }),
+    body: JSON.stringify({ prompt }),
   });
 
-  if (!response.ok) throw new Error(`LLM API HTTP ${response.status}`);
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || `Agent proxy HTTP ${response.status}`);
+  }
   const data = await response.json();
-  const text = data.content?.[0]?.text || "";
+  const text = data.text || "";
 
-  // Strip markdown fences if present
-  const clean = text.replace(/```json|```/g, "").trim();
+  // Strip DeepSeek <think> reasoning trace and markdown fences
+  const clean = text
+    .replace(/<think>[\s\S]*?<\/think>/g, "")  // remove DeepSeek chain-of-thought block
+    .replace(/```json|```/g, "")               // remove markdown fences
+    .trim();
   const parsed = JSON.parse(clean);
 
   // Validate required fields
@@ -3312,7 +3316,7 @@ function CryptoAlgoTrader() {
         {creds.agentMode && running && (
           <span style={{ fontSize: 11, color: "#6366f1", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-robot" aria-hidden="true" />
-            {"LLM Agent active — Claude reasoning every "}{creds.agentIntervalSec}{"s"}
+            {"DeepSeek Agent active — reasoning every "}{creds.agentIntervalSec}{"s"}
           </span>
         )}
         {warmingUp && autoEnabled && (
@@ -3794,7 +3798,7 @@ function CryptoAlgoTrader() {
               <span style={{ width: 8, height: 8, borderRadius: "50%", display: "inline-block",
                 background: agentStatus === "thinking" ? "#6366f1" : agentStatus === "ready" ? "#10b981" : agentStatus === "error" ? "#ef4444" : "#94a3b8",
                 animation: agentStatus === "thinking" ? "pulse 1s infinite" : "none" }} />
-              {"🤖 LLM Agent"} {agentStatus === "thinking" ? "— thinking..." : agentStatus === "ready" ? "— ready" : agentStatus === "error" ? "— error" : "— idle"}
+              {"🤖 DeepSeek Agent"} {agentStatus === "thinking" ? "— thinking..." : agentStatus === "ready" ? "— ready" : agentStatus === "error" ? "— error" : "— idle"}
             </span>
             <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
               Every {creds.agentIntervalSec}s
