@@ -1185,6 +1185,7 @@ function SettingsModal({ creds, onSave, onClose }) {
     keys:          { ...defaultKeys, ...creds.keys },
     exitRules:     creds.exitRules || defaultExitRules,
     exitStrategies: creds.exitStrategies || {
+      trailingTakeProfit: { enabled: false, trailPercent: "1.0" },
       timeExit:       { enabled: true,  maxHoldMinutes: "30"  },
       trailingStop:   { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" },
       atrExit:        { enabled: false, atrMultiplier:  "1.5" },
@@ -1455,6 +1456,12 @@ function SettingsModal({ creds, onSave, onClose }) {
 
                 {/* Time-based exit */}
                 {[
+                  {
+                    key: "trailingTakeProfit",
+                    label: "🎯 Trailing take-profit",
+                    desc: "Let profits run after TP is hit — sell only when price reverses by a set %",
+                    fields: [{ k: "trailPercent", label: "Reversal % from peak", min: 0.1, max: 20, step: 0.1, hint: "e.g. 1% = sell when price drops 1% from post-TP peak" }],
+                  },
                   {
                     key: "timeExit",
                     label: "⏱ Time-based exit",
@@ -1907,6 +1914,7 @@ function CryptoAlgoTrader() {
       SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
     },
     exitStrategies: {
+      trailingTakeProfit: { enabled: false, trailPercent: "1.0" },
       timeExit:        { enabled: true,  maxHoldMinutes: "30"  },
       trailingStop:    { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" }, // "absolute"=$, "percent"=%
       atrExit:         { enabled: false, atrMultiplier:  "1.5" },
@@ -1990,6 +1998,9 @@ function CryptoAlgoTrader() {
   const COOLDOWN_MS = 60_000; // default - overridden per-tick by creds.cooldownMinutes
   // Per-coin trailing stop high-water mark (highest price since entry)
   const trailingHighRef = useRef({ BTC: null, ETH: null, SOL: null });
+  // Per-coin trailing take-profit state: { armed: bool, peak: number }
+  // armed = true once price has hit the TP level; peak tracks high-water from that point
+  const trailingTpRef = useRef({ BTC: null, ETH: null, SOL: null });
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -2469,6 +2480,7 @@ function CryptoAlgoTrader() {
       orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
       cooldownRef.current      = { BTC: null, ETH: null, SOL: null };
       trailingHighRef.current  = { BTC: null, ETH: null, SOL: null };
+      trailingTpRef.current    = { BTC: null, ETH: null, SOL: null };
       tickRef.current          = 0;
       liveStartRef.current    = Date.now();
       setSnapshot(JSON.parse(JSON.stringify(s)));
@@ -2642,6 +2654,7 @@ function CryptoAlgoTrader() {
     orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
     cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
     trailingHighRef.current = { BTC: null, ETH: null, SOL: null };
+    trailingTpRef.current   = { BTC: null, ETH: null, SOL: null };
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -2710,8 +2723,42 @@ function CryptoAlgoTrader() {
       const stopLossPrice = cs.position
         ? resolveLevel(exitRule.stopLossType, exitRule.stopLossValue, "down") : null;
 
-      const hitTakeProfit = takeProfitPrice && newPrice >= takeProfitPrice;
-      const hitStopLoss   = stopLossPrice   && newPrice <= stopLossPrice;
+      const priceHitTP = takeProfitPrice && newPrice >= takeProfitPrice;
+      const hitStopLoss = stopLossPrice && newPrice <= stopLossPrice;
+
+      // ── Trailing take-profit (overshoot & reverse) ───────────────────────────
+      // When enabled: suppress the normal TP sell, arm a trailing exit instead.
+      // Sell only when price reverses from its post-TP peak by trailTpPercent.
+      const ttpCfg = es.trailingTakeProfit;
+      let hitTakeProfit        = false;  // standard TP sell — suppressed when trailing TP on
+      let hitTrailingTakeProfit = false; // trailing TP reversal sell
+
+      if (cs.position && ttpCfg?.enabled) {
+        const ttpPct = parseFloat(ttpCfg.trailPercent) || 1.0;
+        const ttp    = trailingTpRef.current[coin] || { armed: false, peak: null };
+
+        if (!ttp.armed && priceHitTP) {
+          // Price just crossed TP — arm the trailer, start tracking peak
+          trailingTpRef.current[coin] = { armed: true, peak: newPrice };
+          addAutoLog(`🎯 ${coin} TP hit @ $${newPrice.toFixed(2)} — trailing take-profit armed (${ttpPct}% reversal)`, "info");
+        } else if (ttp.armed) {
+          // Update peak
+          if (newPrice > ttp.peak) {
+            trailingTpRef.current[coin] = { ...ttp, peak: newPrice };
+          }
+          // Check reversal from peak
+          const reversalPrice = trailingTpRef.current[coin].peak * (1 - ttpPct / 100);
+          if (newPrice <= reversalPrice) {
+            hitTrailingTakeProfit = true;
+            trailingTpRef.current[coin] = { armed: false, peak: null };
+          }
+        }
+        // Standard TP sell is suppressed — trailing TP handles the exit
+      } else {
+        // Trailing TP off — use standard TP sell as normal
+        hitTakeProfit = priceHitTP;
+        if (!cs.position) trailingTpRef.current[coin] = { armed: false, peak: null };
+      }
 
       // ── 2. Trailing stop ──────────────────────────────────────────────────────
       let hitTrailingStop = false;
@@ -2764,11 +2811,12 @@ function CryptoAlgoTrader() {
 
       // ── Combine all exit triggers ─────────────────────────────────────────────
       const shouldSell = cs.position && (
-        hitTakeProfit || hitStopLoss ||
+        hitTakeProfit || hitTrailingTakeProfit || hitStopLoss ||
         hitTrailingStop || hitATRTP || hitATRStop ||
         hitTimeExit || hitSignalReversal
       );
-      const sellReason = hitTakeProfit ? "TAKE_PROFIT"
+      const sellReason = hitTrailingTakeProfit ? "TRAILING_TAKE_PROFIT"
+        : hitTakeProfit     ? "TAKE_PROFIT"
         : hitStopLoss       ? "STOP_LOSS"
         : hitTrailingStop   ? "TRAILING_STOP"
         : hitATRTP          ? "ATR_TAKE_PROFIT"
@@ -3362,6 +3410,33 @@ function CryptoAlgoTrader() {
                 {sl && <div style={{ fontSize: 10, color: "#ef4444", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↓ SL</span><strong>${fmt(sl, 2)}</strong>
                 </div>}
+                {/* Trailing take-profit status */}
+                {creds.exitStrategies?.trailingTakeProfit?.enabled && coin.position && (() => {
+                  const ttp = trailingTpRef.current[selectedCoin];
+                  const tpPrice = coin.position.price && exitRule.takeProfitValue
+                    ? exitRule.takeProfitType === "percent"
+                      ? coin.position.price * (1 + parseFloat(exitRule.takeProfitValue) / 100)
+                      : coin.position.price + parseFloat(exitRule.takeProfitValue)
+                    : null;
+                  if (ttp?.armed) {
+                    const reversalPx = ttp.peak * (1 - (parseFloat(creds.exitStrategies.trailingTakeProfit.trailPercent) || 1) / 100);
+                    return (
+                      <div style={{ fontSize: 10, color: "#10b981", marginBottom: 2 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between" }}>
+                          <span>🎯 TTP peak</span><strong>${fmt(ttp.peak, 2)}</strong>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between" }}>
+                          <span>Sell if below</span><strong>${fmt(reversalPx, 2)}</strong>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return tpPrice ? (
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 2 }}>
+                      <span>🎯 TTP arms @ </span><strong>${fmt(tpPrice, 2)}</strong>
+                    </div>
+                  ) : null;
+                })()}
                 {creds.exitStrategies?.trailingStop?.enabled && trailingHighRef.current[selectedCoin] && (
                   <div style={{ fontSize: 10, color: "#f59e0b", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                     <span>~ Trail stop</span>
@@ -3558,6 +3633,7 @@ function CryptoAlgoTrader() {
               <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, padding: "4px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                 <Badge action={h.action} />
                 {h.manual && <span style={{ fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 5px", borderRadius: 4, fontWeight: 600 }}>M</span>}
+                {h.exitTrigger === "TRAILING_TAKE_PROFIT" && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TTP</span>}
                 {h.exitTrigger === "TAKE_PROFIT"     && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TP</span>}
                 {h.exitTrigger === "STOP_LOSS"        && <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>SL</span>}
                 {h.exitTrigger === "TRAILING_STOP"    && <span style={{ fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TRL</span>}
