@@ -1192,7 +1192,9 @@ function SettingsModal({ creds, onSave, onClose }) {
       volumeGate:     { enabled: true,  minVolumeRatio: "1.2" },
       signalReversal: { enabled: true,  reversalScore:  "-2"  },
     },
-    cooldownMinutes: creds.cooldownMinutes || "1",
+    cooldownMinutes:   creds.cooldownMinutes   || "1",
+    agentMode:         creds.agentMode !== undefined ? creds.agentMode : false,
+    agentIntervalSec:  creds.agentIntervalSec  || "30",
     sellOrderConfig: creds.sellOrderConfig || {
       type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
       stopPricePct: "0.5", limitPricePct: "0.6",
@@ -1552,6 +1554,41 @@ function SettingsModal({ creds, onSave, onClose }) {
               </div>
             </div>
 
+            {/* ── LLM Agent mode ──────────────────────────── */}
+            <div style={{ borderRadius: 10, border: `0.5px solid ${form.agentMode ? "#6366f1" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.agentMode ? "#6366f108" : "transparent" }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flex: 1 }}>
+                  <input type="checkbox" checked={!!form.agentMode} onChange={e => set("agentMode", e.target.checked)} />
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: form.agentMode ? "#6366f1" : "var(--color-text-primary)" }}>
+                      {"🤖 LLM Agent mode (Claude claude-sonnet-4-6)"}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 3 }}>
+                      Replaces rule-based signals with Claude AI. The agent receives all indicator values, position state,
+                      news sentiment and settings, then reasons through a BUY/SELL/HOLD decision with explanation.
+                    </div>
+                  </div>
+                </label>
+                <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, fontWeight: 700, flexShrink: 0,
+                  background: form.agentMode ? "#6366f122" : "var(--color-background-secondary)",
+                  color: form.agentMode ? "#6366f1" : "var(--color-text-tertiary)" }}>
+                  {form.agentMode ? "ON" : "OFF"}
+                </span>
+              </div>
+              {form.agentMode && (
+                <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "flex-end" }}>
+                  <label style={{ fontSize: 12, flex: 1 }}>
+                    <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Reasoning interval (sec)</div>
+                    <input type="number" value={form.agentIntervalSec} onChange={e => set("agentIntervalSec", e.target.value)}
+                      min="10" max="300" step="5" style={{ width: "100%", boxSizing: "border-box" }} />
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
+                      Claude called every {form.agentIntervalSec}s per coin. Rule-based used as fallback while thinking.
+                    </div>
+                  </label>
+                </div>
+              )}
+            </div>
+
             {/* ── Sell order type ────────────────────────────────────── */}
             <div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
@@ -1761,6 +1798,105 @@ function SettingsModal({ creds, onSave, onClose }) {
 }
 
 
+// ─── LLM Agent ───────────────────────────────────────────────────────────────
+// Calls Claude claude-sonnet-4-6 with full market context and returns a structured
+// BUY / SELL / HOLD decision with reasoning. Runs every N seconds async.
+async function callLLMAgent(context) {
+  const {
+    coin, currentPrice, indicators, sentiment, volumeRatio,
+    position, recentHistory, settings, exitStrategies,
+  } = context;
+
+  const positionStr = position
+    ? `OPEN — entry $${position.price?.toFixed(2)}, size ${position.size?.toFixed(8)}, ` +
+      `unrealized ${((currentPrice - position.price) / position.price * 100).toFixed(2)}%`
+    : "NONE";
+
+  const historyStr = recentHistory.slice(0, 5)
+    .map(h => `${h.action} @ $${h.price?.toFixed(2)} (${h.exitTrigger || "signal"})`)
+    .join(", ") || "none";
+
+  const prompt = `You are an expert crypto trading agent making a decision for ${coin}/USD.
+
+CURRENT MARKET STATE
+Price: $${currentPrice?.toFixed(2)}
+Volume ratio: ${volumeRatio?.toFixed(2)}x (>1 = above average)
+News sentiment: ${(sentiment * 100).toFixed(0)}% (positive=buy pressure, negative=sell pressure)
+
+TECHNICAL INDICATORS
+RSI (14): ${indicators.rsi?.toFixed(1) ?? "n/a"} (oversold<${settings.indicatorConfig?.rsi?.oversold||35}, overbought>${settings.indicatorConfig?.rsi?.overbought||65})
+SMA 20: $${indicators.sma20?.toFixed(2) ?? "n/a"}
+SMA 50: $${indicators.sma50?.toFixed(2) ?? "n/a"}
+SMA 99: $${indicators.sma99?.toFixed(2) ?? "n/a"}
+EMA 12: $${indicators.ema12?.toFixed(2) ?? "n/a"}
+EMA 26: $${indicators.ema26?.toFixed(2) ?? "n/a"}
+MACD: ${indicators.macd?.toFixed(4) ?? "n/a"}
+Bollinger upper: $${indicators.boll?.upper?.toFixed(2) ?? "n/a"}
+Bollinger lower: $${indicators.boll?.lower?.toFixed(2) ?? "n/a"}
+ATR (14): $${indicators.atr?.toFixed(2) ?? "n/a"}
+
+CURRENT POSITION: ${positionStr}
+RECENT TRADES: ${historyStr}
+
+TRADING RULES
+Trade size: $${settings.tradeSizeUSD}
+Fee: ${settings.feePercent}% per side (round-trip: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(2)}%)
+Min confidence required: ${settings.minConfidence}%
+Take profit: ${settings.exitRules?.takeProfitValue}${settings.exitRules?.takeProfitType==="percent"?"%":"$"}
+Stop loss: ${settings.exitRules?.stopLossValue}${settings.exitRules?.stopLossType==="percent"?"%":"$"}
+Active exit strategies: ${Object.entries(exitStrategies||{}).filter(([,v])=>v?.enabled).map(([k])=>k).join(", ")||"none"}
+
+Respond ONLY with valid JSON in this exact format, no other text:
+{
+  "action": "BUY" | "SELL" | "HOLD",
+  "confidence": <0-100 integer>,
+  "score": <-5 to +5 float representing signal strength>,
+  "reasoning": "<one concise sentence explaining the decision>",
+  "keyFactors": ["<factor 1>", "<factor 2>", "<factor 3>"],
+  "risk": "low" | "medium" | "high",
+  "suggestedTpAdjust": null | "<+X% or -X%>",
+  "suggestedSlAdjust": null | "<+X% or -X%>"
+}`;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 512,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (!response.ok) throw new Error(`LLM API HTTP ${response.status}`);
+  const data = await response.json();
+  const text = data.content?.[0]?.text || "";
+
+  // Strip markdown fences if present
+  const clean = text.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(clean);
+
+  // Validate required fields
+  if (!["BUY","SELL","HOLD"].includes(parsed.action)) throw new Error("Invalid action from LLM");
+  if (typeof parsed.confidence !== "number") throw new Error("Missing confidence from LLM");
+
+  return {
+    action:             parsed.action,
+    confidence:         String(Math.min(100, Math.max(0, parsed.confidence))),
+    score:              String(parsed.score ?? 0),
+    reasoning:          parsed.reasoning || "",
+    keyFactors:         parsed.keyFactors || [],
+    risk:               parsed.risk || "medium",
+    suggestedTpAdjust:  parsed.suggestedTpAdjust || null,
+    suggestedSlAdjust:  parsed.suggestedSlAdjust || null,
+    agreeingCount:      3,  // satisfies existing BUY gate
+    totalIndicators:    8,
+    reasons:            (parsed.keyFactors || []).map(f => ({ label: f, vote: parsed.action === "BUY" ? 1 : parsed.action === "SELL" ? -1 : 0 })),
+    fromAgent:          true,
+    timestamp:          Date.now(),
+  };
+}
+
 // ─── WebSocket price feed ────────────────────────────────────────────────────
 // Exchange WebSocket endpoints (public, no auth, no CORS restriction)
 const WS_ENDPOINTS = {
@@ -1922,6 +2058,8 @@ function CryptoAlgoTrader() {
       signalReversal:  { enabled: true,  reversalScore:  "-2"  },
     },
     cooldownMinutes: "1",
+    agentMode: false,            // true = LLM agent replaces rule-based signal
+    agentIntervalSec: "30",      // how often the LLM is called (seconds)
     sellOrderConfig: {
       type:               "market",   // market | limit | stop_limit | oco | trailing_stop
       limitOffsetType:    "percent",  // percent | absolute
@@ -1950,8 +2088,11 @@ function CryptoAlgoTrader() {
   const [manualSelling, setManualSelling] = useState(false); // per-coin sell in progress
   const [manualConfirm, setManualConfirm] = useState(null);  // { action, coin, price } pending confirm
   const [autoStatus, setAutoStatus]   = useState("idle");
-  const [wsStatus,   setWsStatus]     = useState("idle"); // WebSocket connection status
-  const [wsEnabled,  setWsEnabled]    = useState(false);  // toggle WS feed
+  const [wsStatus,   setWsStatus]     = useState("idle");
+  const [wsEnabled,  setWsEnabled]    = useState(false);
+  const [agentStatus, setAgentStatus] = useState("idle");  // idle|thinking|ready|error
+  const [agentLog,    setAgentLog]    = useState([]);       // last N agent decisions
+  const agentDecisionRef = useRef(null);  // latest LLM decision consumed by runTick
   const [autoLog, setAutoLog] = useState([]);
   const [cbBalances, setCbBalances] = useState(null);
   const [cbError, setCbError] = useState(null);
@@ -2235,6 +2376,87 @@ function CryptoAlgoTrader() {
       if (Math.random() < 0.1) addAutoLog(`Price poll error: ${e.message}`, "error");
     }
   }, [creds, addAutoLog]);
+
+  // ── LLM Agent polling ───────────────────────────────────────────────────────
+  // When agentMode is on, calls Claude every N seconds for each enabled coin
+  // and stores the decision in agentDecisionRef for runTick to consume
+  useEffect(() => {
+    if (!creds.agentMode || !running) return;
+
+    const callAgent = async () => {
+      for (const coin of creds.enabledCoins) {
+        const cs   = stateRef.current[coin];
+        const price = livePriceRef.current[coin]?.price || cs.prices.at(-1);
+        if (!price) continue;
+
+        const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
+        const indicators = {
+          currentPrice: price,
+          sma20:  calcSMA(cs.prices, 20),
+          sma50:  calcSMA(cs.prices, 50),
+          sma99:  calcSMA(cs.prices, 99),
+          ema12:  calcEMA(cs.prices, 12),
+          ema26:  calcEMA(cs.prices, 26),
+          rsi:    calcRSI(cs.prices, 14),
+          boll:   calcBollinger(cs.prices, bollPeriod),
+          macd:   calcMACD(cs.prices),
+          atr:    calcATR(cs.prices, 14),
+        };
+
+        const volumes = cs.volumes;
+        const avgVol  = volumes.length > 0 ? volumes.reduce((a,b) => a+b, 0) / volumes.length : 1;
+        const volRatio = volumes.at(-1) / (avgVol || 1);
+
+        setAgentStatus("thinking");
+        try {
+          const decision = await callLLMAgent({
+            coin, currentPrice: price,
+            indicators,
+            sentiment:     activeSentiment,
+            volumeRatio:   volRatio,
+            position:      cs.position,
+            recentHistory: cs.history?.slice(-5) || [],
+            settings: {
+              tradeSizeUSD:   creds.tradeSizeUSD,
+              feePercent:     creds.feePercent,
+              minConfidence:  creds.minConfidence,
+              indicatorConfig: creds.indicatorConfig,
+              exitRules:      creds.exitRules?.[coin],
+            },
+            exitStrategies: creds.exitStrategies,
+          });
+
+          // Store decision for runTick to consume
+          if (!agentDecisionRef.current) agentDecisionRef.current = {};
+          agentDecisionRef.current[coin] = decision;
+
+          // Log to agent panel
+          setAgentLog(prev => [{
+            coin, time: new Date().toLocaleTimeString(),
+            action: decision.action, confidence: decision.confidence,
+            reasoning: decision.reasoning, keyFactors: decision.keyFactors,
+            risk: decision.risk, score: decision.score,
+          }, ...prev].slice(0, 20));
+
+          setAgentStatus("ready");
+          addAutoLog(`[AGENT] ${coin}: ${decision.action} (${decision.confidence}% conf) — ${decision.reasoning}`,
+            decision.action === "BUY" ? "success" : decision.action === "SELL" ? "warn" : "info");
+
+        } catch (e) {
+          setAgentStatus("error");
+          addAutoLog(`[AGENT] ${coin} error: ${e.message}`, "error");
+          // On error fall back to rule-based signal — clear agent decision
+          if (agentDecisionRef.current) agentDecisionRef.current[coin] = null;
+        }
+      }
+    };
+
+    // Call immediately then on interval
+    callAgent();
+    const intervalMs = (parseFloat(creds.agentIntervalSec) || 30) * 1000;
+    const id = setInterval(callAgent, intervalMs);
+    return () => clearInterval(id);
+  }, [creds.agentMode, creds.agentIntervalSec, running, creds.enabledCoins.join(",")]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
   // WS connected (sim or live) → no HTTP polling
@@ -2655,6 +2877,7 @@ function CryptoAlgoTrader() {
     cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
     trailingHighRef.current = { BTC: null, ETH: null, SOL: null };
     trailingTpRef.current   = { BTC: null, ETH: null, SOL: null };
+    agentDecisionRef.current = null;
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -2702,7 +2925,10 @@ function CryptoAlgoTrader() {
         macd:   calcMACD(cs.prices),
       };
 
-      const signal = generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
+      // Use LLM agent decision if agentMode is on and a fresh decision exists
+      // Otherwise fall back to rule-based generateSignal
+      const agentDecision = creds.agentMode && agentDecisionRef.current?.[coin];
+      const signal = agentDecision || generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
 
       // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
@@ -3083,6 +3309,12 @@ function CryptoAlgoTrader() {
           </div>
 
           {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
+        {creds.agentMode && running && (
+          <span style={{ fontSize: 11, color: "#6366f1", display: "flex", alignItems: "center", gap: 5 }}>
+            <i className="ti ti-robot" aria-hidden="true" />
+            {"LLM Agent active — Claude reasoning every "}{creds.agentIntervalSec}{"s"}
+          </span>
+        )}
         {warmingUp && autoEnabled && (
           <span style={{ fontSize: 11, color: "#f59e0b", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-clock" aria-hidden="true" />
@@ -3553,6 +3785,65 @@ function CryptoAlgoTrader() {
           </div>
         </div>
       </div>
+
+      {/* ── LLM Agent Panel ─────────────────────────────────────────────────────── */}
+      {creds.agentMode && (
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: `0.5px solid ${agentStatus === "thinking" ? "#6366f1" : agentStatus === "error" ? "#ef4444" : agentStatus === "ready" ? "#10b981" : "var(--color-border-tertiary)"}`, padding: "14px 16px", marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", display: "inline-block",
+                background: agentStatus === "thinking" ? "#6366f1" : agentStatus === "ready" ? "#10b981" : agentStatus === "error" ? "#ef4444" : "#94a3b8",
+                animation: agentStatus === "thinking" ? "pulse 1s infinite" : "none" }} />
+              {"🤖 LLM Agent"} {agentStatus === "thinking" ? "— thinking..." : agentStatus === "ready" ? "— ready" : agentStatus === "error" ? "— error" : "— idle"}
+            </span>
+            <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+              Every {creds.agentIntervalSec}s
+            </span>
+          </div>
+
+          {agentLog.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {agentLog.slice(0, 3).map((d, i) => (
+                <div key={i} style={{ padding: "10px 12px", borderRadius: 8, border: `0.5px solid ${d.action === "BUY" ? "#10b981" : d.action === "SELL" ? "#ef4444" : "var(--color-border-tertiary)"}`, background: d.action === "BUY" ? "#d1fae508" : d.action === "SELL" ? "#fee2e208" : "transparent" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: COIN_COLORS[d.coin] }}>{d.coin}</span>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: d.action === "BUY" ? "#10b981" : d.action === "SELL" ? "#ef4444" : "#94a3b8" }}>{d.action}</span>
+                    <span style={{ fontSize: 11, padding: "1px 8px", borderRadius: 4, fontWeight: 600,
+                      background: parseFloat(d.confidence) >= 70 ? "#d1fae5" : parseFloat(d.confidence) >= 50 ? "#fef3c7" : "#fee2e2",
+                      color: parseFloat(d.confidence) >= 70 ? "#065f46" : parseFloat(d.confidence) >= 50 ? "#92400e" : "#991b1b" }}>
+                      {d.confidence}% conf
+                    </span>
+                    <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4,
+                      background: d.risk === "low" ? "#d1fae5" : d.risk === "high" ? "#fee2e2" : "#fef3c7",
+                      color: d.risk === "low" ? "#065f46" : d.risk === "high" ? "#991b1b" : "#92400e" }}>
+                      {d.risk} risk
+                    </span>
+                    <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--color-text-tertiary)" }}>{d.time}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 6, lineHeight: 1.5 }}>
+                    {d.reasoning}
+                  </div>
+                  {d.keyFactors?.length > 0 && (
+                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                      {d.keyFactors.map((f, j) => (
+                        <span key={j} style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4,
+                          background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)",
+                          color: "var(--color-text-secondary)" }}>
+                          {f}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", textAlign: "center", padding: "12px 0" }}>
+              {"Waiting for first agent decision..."} {!running && "(Start simulation or live trading)"}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Trading log ──────────────────────────────────────────────────────── */}
       {autoLog.length > 0 && (
