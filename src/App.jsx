@@ -1841,7 +1841,8 @@ function buildSequence(prices, allIndicators) {
 }
 
 // Create and compile LSTM model
-async function createLSTMModel(tf) {
+async function createLSTMModel(_tf) {
+  const tf = window.tf;
   const model = tf.sequential();
   model.add(tf.layers.lstm({
     units: 64, inputShape: [LSTM_SEQ_LEN, LSTM_FEATURES],
@@ -1854,7 +1855,7 @@ async function createLSTMModel(tf) {
   }));
   model.add(tf.layers.dropout({ rate: 0.1 }));
   model.add(tf.layers.dense({ units: 16, activation: "relu" }));
-  model.add(tf.layers.dense({ units: 3, activation: "tanh" })); // [changePct, trend, volatility]
+  model.add(tf.layers.dense({ units: 3, activation: "tanh" }));
   model.compile({
     optimizer: tf.train.adam(0.001),
     loss: "meanSquaredError",
@@ -1863,7 +1864,8 @@ async function createLSTMModel(tf) {
 }
 
 // Train LSTM on historical price data
-async function trainLSTM(tf, coin, prices, indicators) {
+async function trainLSTM(_tf, coin, prices, indicators) {
+  const tf = window.tf;
   if (prices.length < LSTM_SEQ_LEN + 20) return null; // need enough data
 
   const model = lstmModels[coin] || await createLSTMModel(tf);
@@ -1913,7 +1915,8 @@ async function trainLSTM(tf, coin, prices, indicators) {
 }
 
 // Run inference — get prediction for current state
-async function runLSTMInference(tf, coin, prices, indicators) {
+async function runLSTMInference(_tf, coin, prices, indicators) {
+  const tf = window.tf;
   const model = lstmModels[coin];
   if (!model) return null;
   const seq = buildSequence(prices, indicators);
@@ -1937,7 +1940,12 @@ async function runLSTMInference(tf, coin, prices, indicators) {
 }
 
 // Main LSTM manager — train if needed, return latest prediction
-async function getLSTMPrediction(tf, coin, prices, indicators) {
+async function getLSTMPrediction(_tf, coin, prices, indicators) {
+  const tf = window.tf;
+  if (!tf?.sequential) {
+    console.error("[LSTM] window.tf not available or invalid:", typeof window.tf);
+    throw new Error("TensorFlow.js not loaded — window.tf.sequential is missing");
+  }
   const now       = Date.now();
   const lastTrain = lstmLastTrain[coin] || 0;
   const needsTrain = !lstmModels[coin] || (now - lastTrain) > LSTM_RETRAIN_MS;
@@ -2627,20 +2635,45 @@ function CryptoAlgoTrader() {
     return () => clearInterval(id);
   }, [creds.agentMode, creds.agentIntervalSec, running, creds.enabledCoins.join(",")]);
 
-  // ── TensorFlow.js lazy loader ────────────────────────────────────────────────
+  // ── TensorFlow.js loader ─────────────────────────────────────────────────────
+  // Inject a <script> tag — works in Vite, Netlify and iframe environments
+  // window.tf is set once the script loads
   useEffect(() => {
     if (!creds.agentMode) return;
-    import("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js")
-      .then(tf => { tfRef.current = tf; setLstmStatus("ready"); })
-      .catch(e => { console.error("TF.js load failed:", e); setLstmStatus("error"); });
+    if (window.tf) { tfRef.current = window.tf; setLstmStatus("ready"); return; }
+    if (document.getElementById("tfjs-script")) return; // already loading
+    setLstmStatus("loading");
+    const script = document.createElement("script");
+    script.id  = "tfjs-script";
+    script.src = "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js";
+    script.onload = () => {
+      if (window.tf) {
+        tfRef.current = window.tf;
+        setLstmStatus("ready");
+        console.log("[LSTM] TensorFlow.js loaded — version", window.tf.version.tfjs);
+      } else {
+        setLstmStatus("error");
+        console.error("[LSTM] TF.js script loaded but window.tf not found");
+      }
+    };
+    script.onerror = (e) => {
+      setLstmStatus("error");
+      console.error("[LSTM] TF.js script failed to load:", e);
+      document.getElementById("tfjs-script")?.remove();
+    };
+    document.head.appendChild(script);
   }, [creds.agentMode]);
 
   // ── LSTM prediction loop ───────────────────────────────────────────────────
   // Runs every 60s when agentMode is on — trains/infers for each coin
   useEffect(() => {
     if (!creds.agentMode || !running) return;
-    const tf = tfRef.current;
-    if (!tf) return; // TF.js not yet loaded
+    const tf = tfRef.current || window.tf; // also check window.tf directly
+    if (!tf) {
+      console.log("[LSTM] TF.js not ready yet — waiting");
+      return;
+    }
+    tfRef.current = tf; // cache it
 
     const runLSTM = async () => {
       for (const coin of creds.enabledCoins) {
@@ -2662,8 +2695,9 @@ function CryptoAlgoTrader() {
             setLstmStatus("ready");
           }
         } catch (e) {
-          console.error(`LSTM error for ${coin}:`, e);
+          console.error(`[LSTM] error for ${coin}:`, e.message, e.stack);
           setLstmStatus("error");
+          addAutoLog(`[LSTM] ${coin} error: ${e.message}`, "error");
         }
       }
     };
@@ -2671,7 +2705,7 @@ function CryptoAlgoTrader() {
     runLSTM(); // immediate first run
     const id = setInterval(runLSTM, 60_000);
     return () => clearInterval(id);
-  }, [creds.agentMode, creds.enabledCoins.join(","), running, lstmStatus === "ready"]);
+  }, [creds.agentMode, creds.enabledCoins.join(","), running, lstmStatus]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
   // WS connected (sim or live) → no HTTP polling
@@ -3453,6 +3487,12 @@ function CryptoAlgoTrader() {
 
   return (
     <div style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 13, color: "var(--color-text-primary)", padding: "12px 0" }}>
+      {/* Preload TF.js — loads early so LSTM is ready when agent mode activates */}
+      <script
+        id="tfjs-preload"
+        src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"
+        async
+      />
       {/* Inject CSS tokens for non-Claude environments (Vite, Netlify, etc.) */}
       <style>{`
         :root {
@@ -4022,7 +4062,7 @@ function CryptoAlgoTrader() {
               <span style={{ width: 7, height: 7, borderRadius: "50%", display: "inline-block",
                 background: lstmStatus === "ready" ? "#10b981" : lstmStatus === "training" ? "#f59e0b" : lstmStatus === "error" ? "#ef4444" : "#94a3b8" }} />
               <span style={{ color: "var(--color-text-secondary)" }}>
-                LSTM: {lstmStatus === "idle" ? "idle — start to activate" : lstmStatus === "training" ? "training..." : lstmStatus === "ready" ? "ready" : "error"}
+                LSTM: {lstmStatus === "idle" ? "idle" : lstmStatus === "loading" ? "loading TF.js..." : lstmStatus === "training" ? "training..." : lstmStatus === "ready" ? "ready" : `error — check console`}
               </span>
             </span>
             {creds.enabledCoins.map(coin => {
