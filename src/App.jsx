@@ -1582,7 +1582,7 @@ function SettingsModal({ creds, onSave, onClose }) {
                     <input type="number" value={form.agentIntervalSec} onChange={e => set("agentIntervalSec", e.target.value)}
                       min="10" max="300" step="5" style={{ width: "100%", boxSizing: "border-box" }} />
                     <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
-                      DeepSeek called every {form.agentIntervalSec}s per coin. Rule-based used as fallback while thinking.
+                      DeepSeek called every {form.agentIntervalSec}s. LSTM trained in-browser every 5 min (needs 80+ ticks). Rule-based signal used as fallback while agent thinks.
                     </div>
                   </label>
                 </div>
@@ -1798,13 +1798,167 @@ function SettingsModal({ creds, onSave, onClose }) {
 }
 
 
+// ─── LSTM RNN Model ──────────────────────────────────────────────────────────
+// Browser-native LSTM using TensorFlow.js
+// Architecture: 60-step sequence → LSTM(64) → LSTM(32) → Dense(3)
+// Inputs per step: [normPrice, rsi, macdNorm, bollingerPct, volRatio, emaRatio]
+// Outputs: [predictedChangePct, trendScore(-1 to 1), volatilityScore(0 to 1)]
+
+const LSTM_SEQ_LEN     = 60;   // lookback window (ticks)
+const LSTM_FEATURES    = 6;    // input features per timestep
+const LSTM_RETRAIN_MS  = 5 * 60 * 1000; // retrain every 5 minutes
+
+// Per-coin LSTM state
+const lstmModels    = {};  // { BTC: tf.Model, ... }
+const lstmLastTrain = {};  // { BTC: timestamp, ... }
+const lstmPredCache = {};  // { BTC: { predictedChangePct, trendScore, volatility, trainedAt } }
+
+// Build feature vector for one timestep
+function buildLSTMFeatures(prices, i, indicators) {
+  const price  = prices[i];
+  const prev   = prices[Math.max(0, i - 1)] || price;
+  const mean   = prices.slice(Math.max(0, i - 20), i + 1).reduce((a, b) => a + b, 0) / Math.min(i + 1, 20);
+  const std    = Math.sqrt(prices.slice(Math.max(0, i - 20), i + 1).reduce((a, b) => a + (b - mean) ** 2, 0) / Math.min(i + 1, 20)) || 1;
+  return [
+    (price - mean) / std,                                              // 0: z-score normalised price
+    ((indicators?.rsi ?? 50) - 50) / 50,                              // 1: RSI centred on 0
+    Math.max(-1, Math.min(1, (indicators?.macd ?? 0) / (price * 0.01))), // 2: MACD normalised
+    indicators?.boll ? (price - indicators.boll.lower) / (indicators.boll.upper - indicators.boll.lower || 1) * 2 - 1 : 0, // 3: Bollinger %B
+    Math.min(2, Math.max(-2, (price - prev) / prev * 100)) / 2,      // 4: 1-tick return
+    indicators?.ema12 && indicators?.ema26 ? (indicators.ema12 - indicators.ema26) / price : 0, // 5: EMA ratio
+  ];
+}
+
+// Build full sequence tensor from price history
+function buildSequence(prices, allIndicators) {
+  if (prices.length < LSTM_SEQ_LEN) return null;
+  const seq = [];
+  const start = prices.length - LSTM_SEQ_LEN;
+  for (let i = start; i < prices.length; i++) {
+    seq.push(buildLSTMFeatures(prices, i, allIndicators));
+  }
+  return seq; // shape: [LSTM_SEQ_LEN, LSTM_FEATURES]
+}
+
+// Create and compile LSTM model
+async function createLSTMModel(tf) {
+  const model = tf.sequential();
+  model.add(tf.layers.lstm({
+    units: 64, inputShape: [LSTM_SEQ_LEN, LSTM_FEATURES],
+    returnSequences: true, kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
+  }));
+  model.add(tf.layers.dropout({ rate: 0.2 }));
+  model.add(tf.layers.lstm({
+    units: 32, returnSequences: false,
+    kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
+  }));
+  model.add(tf.layers.dropout({ rate: 0.1 }));
+  model.add(tf.layers.dense({ units: 16, activation: "relu" }));
+  model.add(tf.layers.dense({ units: 3, activation: "tanh" })); // [changePct, trend, volatility]
+  model.compile({
+    optimizer: tf.train.adam(0.001),
+    loss: "meanSquaredError",
+  });
+  return model;
+}
+
+// Train LSTM on historical price data
+async function trainLSTM(tf, coin, prices, indicators) {
+  if (prices.length < LSTM_SEQ_LEN + 20) return null; // need enough data
+
+  const model = lstmModels[coin] || await createLSTMModel(tf);
+  lstmModels[coin] = model;
+
+  // Build training samples: X = sequence, Y = next-tick outcomes
+  const X = [], Y = [];
+  const trainEnd = prices.length - 1;
+  const trainStart = Math.max(LSTM_SEQ_LEN, trainEnd - 300); // use last 300 ticks
+
+  for (let i = trainStart; i < trainEnd; i++) {
+    const slice  = prices.slice(i - LSTM_SEQ_LEN, i);
+    const seq    = [];
+    for (let j = 0; j < LSTM_SEQ_LEN; j++) {
+      seq.push(buildLSTMFeatures(slice, j, indicators));
+    }
+    const future = prices[i];
+    const past   = prices[i - 1];
+    const changePct = Math.max(-1, Math.min(1, (future - past) / past * 100 / 2));
+    // Trend: positive if price is above 20-period SMA at this point
+    const sma20 = slice.slice(-20).reduce((a, b) => a + b, 0) / 20;
+    const trend = Math.max(-1, Math.min(1, (future - sma20) / sma20 * 50));
+    // Volatility: std of last 10 returns, normalised
+    const returns = slice.slice(-10).map((p, k) => k > 0 ? (p - slice[slice.length - 10 + k - 1]) / slice[slice.length - 10 + k - 1] : 0);
+    const volStd  = Math.sqrt(returns.reduce((a, b) => a + b * b, 0) / returns.length);
+    const volatility = Math.min(1, volStd * 100);
+    X.push(seq);
+    Y.push([changePct, trend, volatility]);
+  }
+
+  if (X.length < 10) return null;
+
+  const xTensor = tf.tensor3d(X);
+  const yTensor = tf.tensor2d(Y);
+
+  try {
+    await model.fit(xTensor, yTensor, {
+      epochs: 15, batchSize: 32, validationSplit: 0.1, shuffle: true,
+      callbacks: { onEpochEnd: () => {} }, // silent
+    });
+  } finally {
+    xTensor.dispose();
+    yTensor.dispose();
+  }
+
+  return model;
+}
+
+// Run inference — get prediction for current state
+async function runLSTMInference(tf, coin, prices, indicators) {
+  const model = lstmModels[coin];
+  if (!model) return null;
+  const seq = buildSequence(prices, indicators);
+  if (!seq) return null;
+
+  const input = tf.tensor3d([seq]); // shape [1, SEQ_LEN, FEATURES]
+  let pred;
+  try {
+    pred = model.predict(input);
+    const [changePct, trend, volatility] = Array.from(await pred.data());
+    return {
+      predictedChangePct: changePct * 2,    // un-scale: was normalised by /2
+      trendScore:         trend,             // -1 (bearish) to +1 (bullish)
+      volatility:         Math.abs(volatility), // 0 (calm) to 1 (volatile)
+      trainedOn:          prices.length,
+    };
+  } finally {
+    input.dispose();
+    pred?.dispose();
+  }
+}
+
+// Main LSTM manager — train if needed, return latest prediction
+async function getLSTMPrediction(tf, coin, prices, indicators) {
+  const now       = Date.now();
+  const lastTrain = lstmLastTrain[coin] || 0;
+  const needsTrain = !lstmModels[coin] || (now - lastTrain) > LSTM_RETRAIN_MS;
+
+  if (needsTrain && prices.length >= LSTM_SEQ_LEN + 20) {
+    await trainLSTM(tf, coin, prices, indicators);
+    lstmLastTrain[coin] = now;
+  }
+
+  const prediction = await runLSTMInference(tf, coin, prices, indicators);
+  if (prediction) lstmPredCache[coin] = { ...prediction, timestamp: now };
+  return lstmPredCache[coin] || null;
+}
+
 // ─── LLM Agent ───────────────────────────────────────────────────────────────
 // Calls Claude claude-sonnet-4-6 with full market context and returns a structured
 // BUY / SELL / HOLD decision with reasoning. Runs every N seconds async.
 async function callLLMAgent(context) {
   const {
     coin, currentPrice, indicators, sentiment, volumeRatio,
-    position, recentHistory, settings, exitStrategies,
+    position, recentHistory, settings, exitStrategies, lstmPrediction,
   } = context;
 
   const positionStr = position
@@ -1834,6 +1988,12 @@ MACD: ${indicators.macd?.toFixed(4) ?? "n/a"}
 Bollinger upper: $${indicators.boll?.upper?.toFixed(2) ?? "n/a"}
 Bollinger lower: $${indicators.boll?.lower?.toFixed(2) ?? "n/a"}
 ATR (14): $${indicators.atr?.toFixed(2) ?? "n/a"}
+
+LSTM RNN PREDICTION (trained on last ${indicators.trainedOn || "N/A"} ticks)
+${lstmPrediction ? `Predicted price change (next tick): ${lstmPrediction.predictedChangePct >= 0 ? "+" : ""}${lstmPrediction.predictedChangePct?.toFixed(3)}%
+Trend score: ${lstmPrediction.trendScore?.toFixed(3)} (-1=strong bear, 0=neutral, +1=strong bull)
+Volatility: ${lstmPrediction.volatility?.toFixed(3)} (0=calm, 1=high volatility)
+LSTM trained on: ${lstmPrediction.trainedOn} price points` : "Not yet available (collecting price history — needs 80+ ticks)"}
 
 CURRENT POSITION: ${positionStr}
 RECENT TRADES: ${historyStr}
@@ -2094,9 +2254,13 @@ function CryptoAlgoTrader() {
   const [autoStatus, setAutoStatus]   = useState("idle");
   const [wsStatus,   setWsStatus]     = useState("idle");
   const [wsEnabled,  setWsEnabled]    = useState(false);
-  const [agentStatus, setAgentStatus] = useState("idle");  // idle|thinking|ready|error
-  const [agentLog,    setAgentLog]    = useState([]);       // last N agent decisions
-  const agentDecisionRef = useRef(null);  // latest LLM decision consumed by runTick
+  const [agentStatus,  setAgentStatus]  = useState("idle");
+  const [agentLog,     setAgentLog]     = useState([]);
+  const agentDecisionRef = useRef(null);
+  // LSTM state
+  const [lstmStatus,   setLstmStatus]   = useState("idle"); // idle|training|ready|error
+  const [lstmPred,     setLstmPred]     = useState({});     // { BTC: prediction, ... }
+  const tfRef          = useRef(null);   // TensorFlow.js instance (lazy-loaded)
   const [autoLog, setAutoLog] = useState([]);
   const [cbBalances, setCbBalances] = useState(null);
   const [cbError, setCbError] = useState(null);
@@ -2416,16 +2580,17 @@ function CryptoAlgoTrader() {
           const decision = await callLLMAgent({
             coin, currentPrice: price,
             indicators,
-            sentiment:     activeSentiment,
-            volumeRatio:   volRatio,
-            position:      cs.position,
-            recentHistory: cs.history?.slice(-5) || [],
+            sentiment:      activeSentiment,
+            volumeRatio:    volRatio,
+            position:       cs.position,
+            recentHistory:  cs.history?.slice(-5) || [],
+            lstmPrediction: lstmPredCache[coin] || null,
             settings: {
-              tradeSizeUSD:   creds.tradeSizeUSD,
-              feePercent:     creds.feePercent,
-              minConfidence:  creds.minConfidence,
+              tradeSizeUSD:    creds.tradeSizeUSD,
+              feePercent:      creds.feePercent,
+              minConfidence:   creds.minConfidence,
               indicatorConfig: creds.indicatorConfig,
-              exitRules:      creds.exitRules?.[coin],
+              exitRules:       creds.exitRules?.[coin],
             },
             exitStrategies: creds.exitStrategies,
           });
@@ -2461,6 +2626,52 @@ function CryptoAlgoTrader() {
     const id = setInterval(callAgent, intervalMs);
     return () => clearInterval(id);
   }, [creds.agentMode, creds.agentIntervalSec, running, creds.enabledCoins.join(",")]);
+
+  // ── TensorFlow.js lazy loader ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!creds.agentMode) return;
+    import("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js")
+      .then(tf => { tfRef.current = tf; setLstmStatus("ready"); })
+      .catch(e => { console.error("TF.js load failed:", e); setLstmStatus("error"); });
+  }, [creds.agentMode]);
+
+  // ── LSTM prediction loop ───────────────────────────────────────────────────
+  // Runs every 60s when agentMode is on — trains/infers for each coin
+  useEffect(() => {
+    if (!creds.agentMode || !running) return;
+    const tf = tfRef.current;
+    if (!tf) return; // TF.js not yet loaded
+
+    const runLSTM = async () => {
+      for (const coin of creds.enabledCoins) {
+        const cs = stateRef.current[coin];
+        if (cs.prices.length < LSTM_SEQ_LEN + 20) continue;
+        const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
+        const indicators = {
+          rsi:  calcRSI(cs.prices, 14),
+          macd: calcMACD(cs.prices),
+          boll: calcBollinger(cs.prices, bollPeriod),
+          ema12: calcEMA(cs.prices, 12),
+          ema26: calcEMA(cs.prices, 26),
+        };
+        try {
+          setLstmStatus("training");
+          const pred = await getLSTMPrediction(tf, coin, cs.prices, indicators);
+          if (pred) {
+            setLstmPred(p => ({ ...p, [coin]: pred }));
+            setLstmStatus("ready");
+          }
+        } catch (e) {
+          console.error(`LSTM error for ${coin}:`, e);
+          setLstmStatus("error");
+        }
+      }
+    };
+
+    runLSTM(); // immediate first run
+    const id = setInterval(runLSTM, 60_000);
+    return () => clearInterval(id);
+  }, [creds.agentMode, creds.enabledCoins.join(","), running, lstmStatus === "ready"]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
   // WS connected (sim or live) → no HTTP polling
@@ -3150,8 +3361,8 @@ function CryptoAlgoTrader() {
             if (result?.success) {
               const actualSellPrice = result.fillPrice || newPrice;
               const profit = calcProfit(posAtSell.price, actualSellPrice, posAtSell.size, creds.feePercent);
-              const feeCost = posAtSell.size * (actualSellPrice * parseFloat(creds.feePercent || 0) / 100 + posAtSell.price * parseFloat(creds.feePercent || 0) / 100);
-              addAutoLog(`P&L: $${profit >= 0 ? "+" : ""}${profit.toFixed(2)} (fees ~$${feeCost.toFixed(2)})`, profit >= 0 ? "success" : "warn");
+              const feeCost = posAtSell.size * (actualSellPrice + posAtSell.price) * (parseFloat(creds.feePercent || 0) / 100);
+              addAutoLog(`P&L: ${profit >= 0 ? "+" : ""}$${Math.abs(profit).toFixed(2)} (fees ~$${feeCost.toFixed(2)})`, profit >= 0 ? "success" : "warn");
               stateRef.current[coin].pnl += profit;
               stateRef.current[coin].trades++;
               setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -3212,13 +3423,13 @@ function CryptoAlgoTrader() {
   const lastH = coin.history[coin.history.length - 1];
   const currentPrice = coin.prices[coin.prices.length - 1];
   const priceChange = coin.prices.length > 1 ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100 : 0;
-  // Dollar P&L: size * (currentPrice - entryPrice)
+  // Dollar P&L after fees — consistent with calcProfit used for closed trades
   const unrealizedDollar = coin.position
-    ? (currentPrice - coin.position.price) * (coin.position.size || 0)
+    ? calcProfit(coin.position.price, currentPrice, coin.position.size || 0, creds.feePercent)
     : 0;
-  // Percentage P&L for display
-  const unrealized = coin.position && coin.position.price
-    ? ((currentPrice - coin.position.price) / coin.position.price) * 100
+  // Percentage P&L (fee-adjusted) — based on net dollar gain vs original cost
+  const unrealized = coin.position && coin.position.price && coin.position.size
+    ? (unrealizedDollar / (coin.position.price * coin.position.size)) * 100
     : 0;
 
   const chartData = coin.history.slice(-60).map((h, i) => ({
@@ -3805,6 +4016,32 @@ function CryptoAlgoTrader() {
             </span>
           </div>
 
+          {/* LSTM Status Row */}
+          <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", display: "inline-block",
+                background: lstmStatus === "ready" ? "#10b981" : lstmStatus === "training" ? "#f59e0b" : lstmStatus === "error" ? "#ef4444" : "#94a3b8" }} />
+              <span style={{ color: "var(--color-text-secondary)" }}>
+                LSTM: {lstmStatus === "idle" ? "idle — start to activate" : lstmStatus === "training" ? "training..." : lstmStatus === "ready" ? "ready" : "error"}
+              </span>
+            </span>
+            {creds.enabledCoins.map(coin => {
+              const p = lstmPred[coin];
+              if (!p) return <span key={coin} style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{coin}: collecting data...</span>;
+              const changeColor = p.predictedChangePct > 0 ? "#10b981" : p.predictedChangePct < 0 ? "#ef4444" : "#94a3b8";
+              return (
+                <span key={coin} style={{ fontSize: 10, display: "flex", gap: 6, padding: "2px 8px", borderRadius: 5, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                  <span style={{ color: COIN_COLORS[coin], fontWeight: 600 }}>{coin}</span>
+                  <span style={{ color: changeColor }}>{p.predictedChangePct >= 0 ? "+" : ""}{p.predictedChangePct?.toFixed(3)}%</span>
+                  <span style={{ color: p.trendScore > 0.1 ? "#10b981" : p.trendScore < -0.1 ? "#ef4444" : "#94a3b8" }}>
+                    {p.trendScore > 0.1 ? "↑ bull" : p.trendScore < -0.1 ? "↓ bear" : "→ flat"}
+                  </span>
+                  <span style={{ color: "var(--color-text-tertiary)" }}>vol:{p.volatility?.toFixed(2)}</span>
+                </span>
+              );
+            })}
+          </div>
+
           {agentLog.length > 0 ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {agentLog.slice(0, 3).map((d, i) => (
@@ -3989,7 +4226,7 @@ function CryptoAlgoTrader() {
         )}
         {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>{"SANDBOX MODE - no real orders"}</span>}
         <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-          {"P&L: $"}{(coin.pnl + unrealizedDollar) >= 0 ? "" : "-"}{"$"}{Math.abs(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}{" "}{coin.trades}{" trades"}
+          {"P&L: "}{(coin.pnl + unrealizedDollar) >= 0 ? "+" : "-"}{"$"}{Math.abs(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}{" "}{coin.trades}{" trades"}
         </span>
       </div>
     </div>
