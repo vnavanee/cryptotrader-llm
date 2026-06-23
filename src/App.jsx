@@ -1941,10 +1941,10 @@ async function runLSTMInference(_tf, coin, prices, indicators) {
 
 // Main LSTM manager — train if needed, return latest prediction
 async function getLSTMPrediction(_tf, coin, prices, indicators) {
-  const tf = window.tf;
-  if (!tf?.sequential) {
-    console.error("[LSTM] window.tf not available or invalid:", typeof window.tf);
-    throw new Error("TensorFlow.js not loaded — window.tf.sequential is missing");
+  // Use passed tf reference (already validated by caller's waitForTF)
+  const tf = (typeof _tf?.sequential === "function") ? _tf : window.tf;
+  if (!tf || typeof tf.sequential !== "function") {
+    throw new Error("TensorFlow.js not ready — tf.sequential unavailable");
   }
   const now       = Date.now();
   const lastTrain = lstmLastTrain[coin] || 0;
@@ -2665,47 +2665,73 @@ function CryptoAlgoTrader() {
   }, [creds.agentMode]);
 
   // ── LSTM prediction loop ───────────────────────────────────────────────────
-  // Runs every 60s when agentMode is on — trains/infers for each coin
   useEffect(() => {
     if (!creds.agentMode || !running) return;
-    const tf = tfRef.current || window.tf; // also check window.tf directly
-    if (!tf) {
-      console.log("[LSTM] TF.js not ready yet — waiting");
-      return;
-    }
-    tfRef.current = tf; // cache it
+    let cancelled = false;
+
+    // Wait until window.tf.sequential is available (script may still be initialising)
+    const waitForTF = () => new Promise((resolve, reject) => {
+      let attempts = 0;
+      const check = () => {
+        if (cancelled) return reject(new Error("cancelled"));
+        const tf = window.tf;
+        if (tf && typeof tf.sequential === "function") {
+          console.log("[LSTM] TF.js ready — version", tf.version?.tfjs || "unknown");
+          return resolve(tf);
+        }
+        if (++attempts > 30) return reject(new Error("TF.js did not load within 30s — check network"));
+        setTimeout(check, 1000);
+      };
+      check();
+    });
 
     const runLSTM = async () => {
+      let tf;
+      try {
+        tf = await waitForTF();
+      } catch (e) {
+        if (!cancelled) { setLstmStatus("error"); addAutoLog(`[LSTM] ${e.message}`, "error"); }
+        return;
+      }
+
       for (const coin of creds.enabledCoins) {
+        if (cancelled) break;
         const cs = stateRef.current[coin];
-        if (cs.prices.length < LSTM_SEQ_LEN + 20) continue;
+        if (cs.prices.length < LSTM_SEQ_LEN + 20) {
+          console.log(`[LSTM] ${coin}: need ${LSTM_SEQ_LEN + 20} ticks, have ${cs.prices.length}`);
+          continue;
+        }
         const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
         const indicators = {
-          rsi:  calcRSI(cs.prices, 14),
-          macd: calcMACD(cs.prices),
-          boll: calcBollinger(cs.prices, bollPeriod),
+          rsi:   calcRSI(cs.prices, 14),
+          macd:  calcMACD(cs.prices),
+          boll:  calcBollinger(cs.prices, bollPeriod),
           ema12: calcEMA(cs.prices, 12),
           ema26: calcEMA(cs.prices, 26),
         };
         try {
           setLstmStatus("training");
+          console.log(`[LSTM] running prediction for ${coin} with ${cs.prices.length} ticks`);
           const pred = await getLSTMPrediction(tf, coin, cs.prices, indicators);
-          if (pred) {
+          if (pred && !cancelled) {
             setLstmPred(p => ({ ...p, [coin]: pred }));
             setLstmStatus("ready");
+            console.log(`[LSTM] ${coin} prediction:`, pred);
           }
         } catch (e) {
-          console.error(`[LSTM] error for ${coin}:`, e.message, e.stack);
-          setLstmStatus("error");
-          addAutoLog(`[LSTM] ${coin} error: ${e.message}`, "error");
+          if (!cancelled) {
+            console.error(`[LSTM] error for ${coin}:`, e);
+            setLstmStatus("error");
+            addAutoLog(`[LSTM] ${coin}: ${e.message}`, "error");
+          }
         }
       }
     };
 
-    runLSTM(); // immediate first run
+    runLSTM();
     const id = setInterval(runLSTM, 60_000);
-    return () => clearInterval(id);
-  }, [creds.agentMode, creds.enabledCoins.join(","), running, lstmStatus]);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [creds.agentMode, creds.enabledCoins.join(","), running]);
 
   // ── Price polling ────────────────────────────────────────────────────────────
   // WS connected (sim or live) → no HTTP polling
