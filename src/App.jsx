@@ -1196,6 +1196,8 @@ function SettingsModal({ creds, onSave, onClose }) {
     agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
     agentIntervalSec:   creds.agentIntervalSec   || "30",
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
+    volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3" },
+    minRrRatio:         creds.minRrRatio         || "3",
     sellOrderConfig: creds.sellOrderConfig || {
       type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
       stopPricePct: "0.5", limitPricePct: "0.6",
@@ -1553,6 +1555,46 @@ function SettingsModal({ creds, onSave, onClose }) {
                   );
                 })}
               </div>
+            </div>
+
+            {/* ── Volatility gate + R:R ratio ─────────────────────────────── */}
+            <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: "var(--color-text-secondary)" }}>
+                Volatility gate + Reward:Risk ratio
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min LSTM volatility</div>
+                  <input type="number" value={form.volatilityGate?.minVolatility || "0.3"}
+                    onChange={e => set("volatilityGate", { ...form.volatilityGate, minVolatility: e.target.value })}
+                    min="0" max="1" step="0.05" style={{ width: "100%", boxSizing: "border-box" }} />
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>LSTM score 0=calm 1=high</div>
+                </label>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min ATR % of price</div>
+                  <input type="number" value={form.volatilityGate?.minAtrPct || "0.3"}
+                    onChange={e => set("volatilityGate", { ...form.volatilityGate, minAtrPct: e.target.value })}
+                    min="0" max="5" step="0.05" style={{ width: "100%", boxSizing: "border-box" }} />
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>Must exceed fee × 1.5</div>
+                </label>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min reward:risk ratio</div>
+                  <input type="number" value={form.minRrRatio || "3"}
+                    onChange={e => set("minRrRatio", e.target.value)}
+                    min="1" max="10" step="0.5" style={{ width: "100%", boxSizing: "border-box" }} />
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>TP must be N times SL</div>
+                </label>
+              </div>
+              <div style={{ fontSize: 11, padding: "8px 12px", borderRadius: 7, background: "var(--color-background-primary)", color: "var(--color-text-secondary)", lineHeight: 1.6, marginBottom: 10 }}>
+                {"Fee round-trip: "}{((parseFloat(form.feePercent||0.1))*2).toFixed(2)}{"% — ATR must exceed "}{((parseFloat(form.feePercent||0.1))*3).toFixed(2)}{"% to profit. At "}{form.minRrRatio||3}{":1 R:R you can be wrong "}{Math.round(100/(1+parseFloat(form.minRrRatio||3)))}{"% of the time and still break even."}
+              </div>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12 }}>
+                <input type="checkbox" checked={!!form.volatilityGate?.enabled}
+                  onChange={e => set("volatilityGate", { ...form.volatilityGate, enabled: e.target.checked })} />
+                <span style={{ color: form.volatilityGate?.enabled ? "#10b981" : "var(--color-text-secondary)", fontWeight: 600 }}>
+                  {form.volatilityGate?.enabled ? "Volatility gate ON" : "Volatility gate OFF"}
+                </span>
+              </label>
             </div>
 
             {/* ── LLM Agent mode ──────────────────────────── */}
@@ -2000,7 +2042,7 @@ async function getLSTMPrediction(_tf, coin, prices, indicators) {
 async function callLLMAgent(context) {
   const {
     coin, currentPrice, indicators, sentiment, volumeRatio,
-    position, recentHistory, settings, exitStrategies, lstmPrediction,
+    position, recentHistory, settings, exitStrategies, lstmPrediction, atrPct,
   } = context;
 
   const positionStr = position
@@ -2042,18 +2084,31 @@ RECENT TRADES: ${historyStr}
 
 TRADING RULES
 Trade size: $${settings.tradeSizeUSD}
-Fee: ${settings.feePercent}% per side (round-trip: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(2)}%)
+Fee per side: ${settings.feePercent}%
+Round-trip fee cost: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}%
+Break-even move needed: ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}% (price must move MORE than this to profit)
+Current ATR (14): $${context.indicators?.atr?.toFixed(2) ?? "n/a"} = ${context.atrPct?.toFixed(3) ?? "n/a"}% of price
+ATR vs break-even: ${context.atrPct ? (context.atrPct / (parseFloat(settings.feePercent||0.1)*2)).toFixed(1) : "n/a"}× (must be >1.5 to be worth trading)
 Min confidence required: ${settings.minConfidence}%
-Take profit: ${settings.exitRules?.takeProfitValue}${settings.exitRules?.takeProfitType==="percent"?"%":"$"}
-Stop loss: ${settings.exitRules?.stopLossValue}${settings.exitRules?.stopLossType==="percent"?"%":"$"}
+Take profit target: ${settings.exitRules?.takeProfitValue}${settings.exitRules?.takeProfitType==="percent"?"%":"$"}
+Stop loss limit: ${settings.exitRules?.stopLossValue}${settings.exitRules?.stopLossType==="percent"?"%":"$"}
+Reward:risk ratio: ${settings.exitRules ? (parseFloat(settings.exitRules.takeProfitValue||2)/parseFloat(settings.exitRules.stopLossValue||1)).toFixed(1) : "n/a"}:1
 Active exit strategies: ${Object.entries(exitStrategies||{}).filter(([,v])=>v?.enabled).map(([k])=>k).join(", ")||"none"}
 
-Respond ONLY with valid JSON in this exact format, no other text:
+DECISION CRITERIA — READ CAREFULLY:
+1. Only return BUY if the expected price move CLEARLY EXCEEDS the round-trip fee of ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}%. Small uncertain moves = HOLD.
+2. The LSTM volatility score must indicate sufficient movement is occurring. Low volatility = HOLD.
+3. Multiple indicators must AGREE — a lone RSI signal in a ranging market is noise, not signal.
+4. Return HOLD for any ambiguous situation. It is far better to miss a trade than lose to fees on a weak signal.
+5. Only return SELL if you have an open position AND indicators suggest reversal or target reached.
+6. Consider the reward:risk ratio — entering with TP < 3× SL is poor risk management.
+
+Respond ONLY with valid JSON, no other text:
 {
   "action": "BUY" | "SELL" | "HOLD",
   "confidence": <0-100 integer>,
   "score": <-5 to +5 float representing signal strength>,
-  "reasoning": "<one concise sentence explaining the decision>",
+  "reasoning": "<one concise sentence — must mention fee profitability>",
   "keyFactors": ["<factor 1>", "<factor 2>", "<factor 3>"],
   "risk": "low" | "medium" | "high",
   "suggestedTpAdjust": null | "<+X% or -X%>",
@@ -2266,6 +2321,12 @@ function CryptoAlgoTrader() {
     cooldownMinutes: "1",
     agentMode: false,
     agentIntervalSec: "30",
+    volatilityGate: {
+      enabled:       true,    // require minimum volatility before BUY
+      minVolatility: "0.3",   // LSTM volatility score must exceed this (0=calm, 1=high)
+      minAtrPct:     "0.3",   // ATR must be >= X% of price (ensures fee-profitable moves possible)
+    },
+    minRrRatio:    "3",        // minimum reward:risk ratio — TP must be >= N × SL
     adaptiveSettings: {
       enabled:       false,   // let agent auto-adjust TP/SL based on regime
       maxTpDelta:    "2",     // max TP adjustment per session in %
@@ -2629,9 +2690,12 @@ function CryptoAlgoTrader() {
 
         setAgentStatus("thinking");
         try {
+          const atr    = indicators.atr || calcATR(cs.prices, 14);
+          const atrPct = atr && price ? (atr / price * 100) : null;
           const decision = await callLLMAgent({
             coin, currentPrice: price,
-            indicators,
+            indicators: { ...indicators, atr },
+            atrPct,
             sentiment:      activeSentiment,
             volumeRatio:    volRatio,
             position:       cs.position,
@@ -3499,12 +3563,43 @@ function CryptoAlgoTrader() {
       const lastSell   = cooldownRef.current[coin];
       const cooldownMs = (parseFloat(creds.cooldownMinutes) || 1) * 60_000;
       const inCooldown = lastSell !== null && (Date.now() - lastSell) < cooldownMs;
-      // ── Strategy 4: Volume gate on BUY ───────────────────────────────────────
+      // ── Volume gate ────────────────────────────────────────────────────────────
       const esV = creds.exitStrategies?.volumeGate;
       const volumeOk = !esV?.enabled || volumeRatio >= (parseFloat(esV.minVolumeRatio) || 1.2);
 
-      // BUY gate: signal + confidence + warmup + no pending + cooldown + volume
-      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown && volumeOk) {
+      // ── Volatility gate (Priority 1) ─────────────────────────────────────────
+      // Only BUY when there is enough market movement to profit after fees
+      const vgCfg     = creds.volatilityGate;
+      const lstmVol   = lstmPredCache[coin]?.volatility ?? 1; // default to pass if no LSTM yet
+      const atr       = calcATR(cs.prices, 14);
+      const atrPct    = atr && newPrice ? (atr / newPrice * 100) : 999;
+      const volGateOk = !vgCfg?.enabled || (
+        lstmVol  >= (parseFloat(vgCfg.minVolatility) || 0.3) &&
+        atrPct   >= (parseFloat(vgCfg.minAtrPct)     || 0.3)
+      );
+
+      // ── Asymmetric TP/SL enforcement ─────────────────────────────────────────
+      // Ensure TP >= minRrRatio × SL so we only trade with favourable risk:reward
+      const minRr  = parseFloat(creds.minRrRatio) || 3;
+      const er     = creds.exitRules?.[coin] || {};
+      const tpVal  = parseFloat(er.takeProfitValue) || 2;
+      const slVal  = parseFloat(er.stopLossValue)   || 1;
+      const rrOk   = minRr <= 0 || (tpVal / slVal) >= minRr;
+
+      // Fee break-even check: ATR-derived expected move must exceed round-trip fee
+      const roundTripFee = (parseFloat(creds.feePercent) || 0.1) * 2;
+      const feeOk = atrPct > roundTripFee * 1.5; // need 1.5× fee to be worth it
+
+      // Log any failed gate conditions when signal says BUY (for transparency)
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
+        if (!volGateOk) addAutoLog(`[GATE] ${coin} BUY blocked — low volatility (LSTM vol:${lstmVol.toFixed(2)} ATR:${atrPct.toFixed(2)}% threshold:${vgCfg?.minAtrPct||0.3}%)`, "warn");
+        if (!rrOk)      addAutoLog(`[GATE] ${coin} BUY blocked — R:R ratio ${(tpVal/slVal).toFixed(1)}:1 < required ${minRr}:1 (adjust TP/SL in settings)`, "warn");
+        if (!feeOk)     addAutoLog(`[GATE] ${coin} BUY blocked — ATR ${atrPct.toFixed(2)}% < 1.5× fee ${roundTripFee.toFixed(2)}% (move too small to profit)`, "warn");
+      }
+
+      // BUY gate: ALL conditions must pass
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup &&
+          noPending && !inCooldown && volumeOk && volGateOk && rrOk && feeOk) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE — log the signal and mark pending immediately
           addAutoLog(`🔔 BUY signal ${coin} @ $${newPrice.toFixed(2)} — conf ${signal.confidence}% score ${signal.score} — submitting order`, "info");
