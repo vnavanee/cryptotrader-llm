@@ -1193,8 +1193,9 @@ function SettingsModal({ creds, onSave, onClose }) {
       signalReversal: { enabled: true,  reversalScore:  "-2"  },
     },
     cooldownMinutes:   creds.cooldownMinutes   || "1",
-    agentMode:         creds.agentMode !== undefined ? creds.agentMode : false,
-    agentIntervalSec:  creds.agentIntervalSec  || "30",
+    agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
+    agentIntervalSec:   creds.agentIntervalSec   || "30",
+    adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     sellOrderConfig: creds.sellOrderConfig || {
       type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
       stopPricePct: "0.5", limitPricePct: "0.6",
@@ -1576,15 +1577,48 @@ function SettingsModal({ creds, onSave, onClose }) {
                 </span>
               </div>
               {form.agentMode && (
-                <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "flex-end" }}>
-                  <label style={{ fontSize: 12, flex: 1 }}>
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+                  <label style={{ fontSize: 12 }}>
                     <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Reasoning interval (sec)</div>
                     <input type="number" value={form.agentIntervalSec} onChange={e => set("agentIntervalSec", e.target.value)}
                       min="10" max="300" step="5" style={{ width: "100%", boxSizing: "border-box" }} />
                     <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
-                      DeepSeek called every {form.agentIntervalSec}s. LSTM trained in-browser every 5 min (needs 80+ ticks). Rule-based signal used as fallback while agent thinks.
+                      DeepSeek called every {form.agentIntervalSec}s. LSTM trained every 5 min (needs 80+ ticks).
                     </div>
                   </label>
+                  {/* Phase 3: Adaptive Settings */}
+                  <div style={{ borderRadius: 8, border: `0.5px solid ${form.adaptiveSettings?.enabled ? "#10b981" : "var(--color-border-tertiary)"}`, padding: "12px", background: form.adaptiveSettings?.enabled ? "#d1fae508" : "transparent" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginBottom: form.adaptiveSettings?.enabled ? 10 : 0 }}>
+                      <input type="checkbox" checked={!!form.adaptiveSettings?.enabled}
+                        onChange={e => set("adaptiveSettings", { ...form.adaptiveSettings, enabled: e.target.checked })} />
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: form.adaptiveSettings?.enabled ? "#10b981" : "var(--color-text-primary)" }}>
+                          Phase 3 — Adaptive TP/SL
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                          Agent auto-adjusts TP/SL based on regime. Applies only after N consistent suggestions above confidence threshold.
+                        </div>
+                      </div>
+                    </label>
+                    {form.adaptiveSettings?.enabled && (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+                        {[
+                          { k: "maxTpDelta",  label: "Max TP adjust (%)", hint: "TP drift cap" },
+                          { k: "maxSlDelta",  label: "Max SL adjust (%)", hint: "SL drift cap" },
+                          { k: "requireHigh", label: "Min confidence",    hint: "% threshold" },
+                          { k: "applyAfter",  label: "Calls needed",      hint: "N consistent" },
+                        ].map(({ k, label, hint }) => (
+                          <label key={k} style={{ fontSize: 11 }}>
+                            <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>{label}</div>
+                            <input type="number" value={form.adaptiveSettings?.[k] || ""}
+                              onChange={e => set("adaptiveSettings", { ...form.adaptiveSettings, [k]: e.target.value })}
+                              min="0" step="0.1" style={{ width: "100%", boxSizing: "border-box", fontSize: 11 }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{hint}</div>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -2230,8 +2264,15 @@ function CryptoAlgoTrader() {
       signalReversal:  { enabled: true,  reversalScore:  "-2"  },
     },
     cooldownMinutes: "1",
-    agentMode: false,            // true = LLM agent replaces rule-based signal
-    agentIntervalSec: "30",      // how often the LLM is called (seconds)
+    agentMode: false,
+    agentIntervalSec: "30",
+    adaptiveSettings: {
+      enabled:       false,   // let agent auto-adjust TP/SL based on regime
+      maxTpDelta:    "2",     // max TP adjustment per session in %
+      maxSlDelta:    "1",     // max SL adjustment per session in %
+      requireHigh:   "70",   // min agent confidence to apply adjustment
+      applyAfter:    "3",    // apply only after N consistent suggestions
+    },
     sellOrderConfig: {
       type:               "market",   // market | limit | stop_limit | oco | trailing_stop
       limitOffsetType:    "percent",  // percent | absolute
@@ -2264,7 +2305,10 @@ function CryptoAlgoTrader() {
   const [wsEnabled,  setWsEnabled]    = useState(false);
   const [agentStatus,  setAgentStatus]  = useState("idle");
   const [agentLog,     setAgentLog]     = useState([]);
-  const agentDecisionRef = useRef(null);
+  const agentDecisionRef   = useRef(null);
+  const [txLog, setTxLog]   = useState([]);
+  const adaptivePendingRef  = useRef({});
+  const [adaptiveState, setAdaptiveState] = useState({});
   // LSTM state
   const [lstmStatus,   setLstmStatus]   = useState("idle"); // idle|training|ready|error
   const [lstmPred,     setLstmPred]     = useState({});     // { BTC: prediction, ... }
@@ -2606,6 +2650,72 @@ function CryptoAlgoTrader() {
           // Store decision for runTick to consume
           if (!agentDecisionRef.current) agentDecisionRef.current = {};
           agentDecisionRef.current[coin] = decision;
+
+          // ── Phase 3: Adaptive Settings ────────────────────────────────────
+          const asCfg = creds.adaptiveSettings;
+          if (asCfg?.enabled && decision.fromAgent) {
+            const minConf = parseFloat(asCfg.requireHigh) || 70;
+            const applyAfter = parseInt(asCfg.applyAfter) || 3;
+            const confOk = parseFloat(decision.confidence) >= minConf;
+
+            if (!adaptivePendingRef.current[coin]) {
+              adaptivePendingRef.current[coin] = { tp: [], sl: [] };
+            }
+            const pending = adaptivePendingRef.current[coin];
+
+            // Accumulate suggestions when confidence is high enough
+            if (confOk && decision.suggestedTpAdjust) {
+              pending.tp.push(decision.suggestedTpAdjust);
+              if (pending.tp.length > applyAfter * 2) pending.tp.shift();
+            }
+            if (confOk && decision.suggestedSlAdjust) {
+              pending.sl.push(decision.suggestedSlAdjust);
+              if (pending.sl.length > applyAfter * 2) pending.sl.shift();
+            }
+
+            // Apply when we have applyAfter consistent suggestions
+            const applyAdjust = (suggestions, type, maxDelta) => {
+              if (suggestions.length < applyAfter) return null;
+              const recent = suggestions.slice(-applyAfter);
+              // All must agree on direction
+              const allPos = recent.every(s => s.startsWith("+"));
+              const allNeg = recent.every(s => s.startsWith("-"));
+              if (!allPos && !allNeg) return null;
+              // Average magnitude
+              const avg = recent.reduce((sum, s) => {
+                return sum + parseFloat(s.replace(/[+%]/g, ""));
+              }, 0) / recent.length;
+              const capped = Math.min(avg, parseFloat(maxDelta) || 2);
+              return (allPos ? "+" : "-") + capped.toFixed(2) + "%";
+            };
+
+            const tpAdj = applyAdjust(pending.tp, "tp", asCfg.maxTpDelta);
+            const slAdj = applyAdjust(pending.sl, "sl", asCfg.maxSlDelta);
+
+            if (tpAdj || slAdj) {
+              setCreds(prev => {
+                const currentRules = prev.exitRules?.[coin] || {};
+                const currentTp    = parseFloat(currentRules.takeProfitValue) || 2;
+                const currentSl    = parseFloat(currentRules.stopLossValue)   || 1;
+                const newTp = tpAdj
+                  ? Math.max(0.1, currentTp + parseFloat(tpAdj))
+                  : currentTp;
+                const newSl = slAdj
+                  ? Math.max(0.1, currentSl + parseFloat(slAdj))
+                  : currentSl;
+                addAutoLog(`[ADAPTIVE] ${coin} TP ${currentTp.toFixed(2)}%→${newTp.toFixed(2)}% SL ${currentSl.toFixed(2)}%→${newSl.toFixed(2)}%`, "info");
+                pending.tp = []; pending.sl = []; // reset after applying
+                setAdaptiveState(a => ({ ...a, [coin]: { tp: newTp, sl: newSl, appliedAt: new Date().toLocaleTimeString() } }));
+                return {
+                  ...prev,
+                  exitRules: {
+                    ...prev.exitRules,
+                    [coin]: { ...currentRules, takeProfitValue: String(newTp.toFixed(2)), stopLossValue: String(newSl.toFixed(2)) },
+                  },
+                };
+              });
+            }
+          }
 
           // Log to agent panel
           setAgentLog(prev => [{
@@ -3156,6 +3266,57 @@ function CryptoAlgoTrader() {
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
+  // ── Transaction logger ───────────────────────────────────────────────────────
+  const logTransaction = useCallback((type, coin, price, qty, pnl, fees, reason, agentReason, lstmData) => {
+    const entry = {
+      id:          Date.now(),
+      timestamp:   new Date().toISOString(),
+      time:        new Date().toLocaleTimeString(),
+      mode:        autoEnabled ? (creds.sandbox ? "sandbox" : "live") : "simulation",
+      type,                          // BUY | SELL
+      coin,
+      price:       parseFloat(price?.toFixed?.(2) || price),
+      qty:         parseFloat(qty?.toFixed?.(8) || qty),
+      usdValue:    parseFloat((price * qty)?.toFixed?.(2) || 0),
+      pnl:         pnl != null ? parseFloat(pnl?.toFixed?.(2)) : null,
+      fees:        fees != null ? parseFloat(fees?.toFixed?.(4)) : null,
+      netPnl:      pnl != null && fees != null ? parseFloat((pnl - fees)?.toFixed?.(2)) : null,
+      exitReason:  reason || null,
+      agentReason: agentReason || null,
+      lstmTrend:   lstmData?.trendScore?.toFixed?.(3) || null,
+      lstmChange:  lstmData?.predictedChangePct?.toFixed?.(3) || null,
+      lstmVol:     lstmData?.volatility?.toFixed?.(3) || null,
+    };
+    setTxLog(prev => [entry, ...prev].slice(0, 1000)); // keep last 1000 trades
+    return entry;
+  }, [autoEnabled, creds.sandbox]);
+
+  // ── CSV export ────────────────────────────────────────────────────────────────
+  const exportTxCSV = useCallback(() => {
+    if (txLog.length === 0) return;
+    const headers = [
+      "Timestamp","Time","Mode","Type","Coin","Price","Qty","USD Value",
+      "P&L ($)","Fees ($)","Net P&L ($)","Exit Reason",
+      "LSTM Trend","LSTM Change%","LSTM Vol","Agent Reasoning"
+    ];
+    const rows = txLog.map(t => [
+      t.timestamp, t.time, t.mode, t.type, t.coin,
+      t.price, t.qty, t.usdValue,
+      t.pnl ?? "", t.fees ?? "", t.netPnl ?? "",
+      t.exitReason ?? "",
+      t.lstmTrend ?? "", t.lstmChange ?? "", t.lstmVol ?? "",
+      (t.agentReason || "").replace(/,/g, ";"),  // escape commas
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `crypto_trades_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [txLog]);
+
   // ── Main simulation tick ────────────────────────────────────────────────────
   const runTick = useCallback(() => {
     const s = stateRef.current;
@@ -3355,13 +3516,18 @@ function CryptoAlgoTrader() {
                 const filledQty  = result.filledQty || (parseFloat(creds.tradeSizeUSD) / newPrice);
                 stateRef.current[coin].position = {
                   price:     entryPrice,
-                  size:      filledQty,   // actual BTC/ETH/SOL quantity filled
+                  size:      filledQty,
                   entryTick: tickRef.current,
                   orderId:   result.orderId,
                   algoOwned: true,
                 };
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+                // Log BUY transaction
+                const fees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
+                logTransaction("BUY", coin, entryPrice, filledQty, null, fees, null,
+                  agentDecisionRef.current?.[coin]?.reasoning,
+                  lstmPredCache[coin]);
               }
             })
             .finally(() => {
@@ -3369,9 +3535,13 @@ function CryptoAlgoTrader() {
               pendingRef.current[coin] = null;
             });
         } else if (!autoEnabled) {
-          // SIMULATION only — never runs when autoEnabled=true
-          cs.position = { price: newPrice, size: parseFloat(creds.tradeSizeUSD) / newPrice, entryTick: tickRef.current, sim: true, algoOwned: true };
+          // SIMULATION only
+          const simSize = parseFloat(creds.tradeSizeUSD) / newPrice;
+          cs.position = { price: newPrice, size: simSize, entryTick: tickRef.current, sim: true, algoOwned: true };
           cs.trades++;
+          const simFees = simSize * newPrice * (parseFloat(creds.feePercent || 0) / 100);
+          logTransaction("BUY", coin, newPrice, simSize, null, simFees, null,
+            agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
         }
       }
 
@@ -3428,6 +3598,9 @@ function CryptoAlgoTrader() {
               setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
               cooldownRef.current[coin] = Date.now();
               addAutoLog(`${coin} cooling off - next BUY in ${creds.cooldownMinutes || 1} min`, "info");
+              // Log SELL transaction
+              logTransaction("SELL", coin, actualSellPrice, posAtSell.size, profit, feeCost, sellReason,
+                agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
             } else {
               stateRef.current[coin].position = posAtSell;
               setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -3437,12 +3610,15 @@ function CryptoAlgoTrader() {
           })();
         } else {
           // SIMULATION — fee-adjusted dollar P&L
-          const profit = calcProfit(cs.position.price, newPrice, cs.position.size, creds.feePercent);
+          const simPos    = { ...cs.position };
+          const profit    = calcProfit(simPos.price, newPrice, simPos.size, creds.feePercent);
+          const simFees   = simPos.size * (newPrice + simPos.price) * (parseFloat(creds.feePercent || 0) / 100);
           cs.pnl += profit;
           cs.position = null;
           cs.trades++;
-          // Cooldown applies in simulation too
           cooldownRef.current[coin] = Date.now();
+          logTransaction("SELL", coin, newPrice, simPos.size, profit, simFees, sellReason,
+            agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
         }
       }
 
@@ -4167,6 +4343,80 @@ function CryptoAlgoTrader() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* ── Transaction Log ──────────────────────────────────────────────────────── */}
+      {txLog.length > 0 && (
+        <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "12px 16px", marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 700 }}>
+              Transaction Log
+              <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-secondary)", marginLeft: 8 }}>
+                {txLog.length} trade{txLog.length !== 1 ? "s" : ""} — sim + live
+              </span>
+            </span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {adaptiveState && Object.entries(adaptiveState).map(([coin, adj]) => adj && (
+                <span key={coin} style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "#6366f122", color: "#6366f1", border: "0.5px solid #6366f144" }}>
+                  {coin} TP {adj.tp?.toFixed(2)}% SL {adj.sl?.toFixed(2)}% @ {adj.appliedAt}
+                </span>
+              ))}
+              <button onClick={exportTxCSV}
+                style={{ padding: "4px 12px", borderRadius: 6, border: "0.5px solid #6366f1", background: "#6366f122", color: "#6366f1", cursor: "pointer", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+                <i className="ti ti-download" aria-hidden="true" /> Export CSV
+              </button>
+            </div>
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+              <thead>
+                <tr style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                  {["Time","Mode","Type","Coin","Price","Qty","USD","P&L","Fees","Exit","LSTM","Agent"].map(h => (
+                    <th key={h} style={{ padding: "4px 8px", textAlign: "left", color: "var(--color-text-tertiary)", fontWeight: 600, fontSize: 10, whiteSpace: "nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {txLog.slice(0, 15).map(t => (
+                  <tr key={t.id} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)", background: t.type === "BUY" ? "#10b98105" : "#ef444405" }}>
+                    <td style={{ padding: "4px 8px", color: "var(--color-text-tertiary)", whiteSpace: "nowrap" }}>{t.time}</td>
+                    <td style={{ padding: "4px 8px", color: "var(--color-text-tertiary)" }}>{t.mode}</td>
+                    <td style={{ padding: "4px 8px", fontWeight: 700, color: t.type === "BUY" ? "#10b981" : "#ef4444" }}>{t.type}</td>
+                    <td style={{ padding: "4px 8px", color: COIN_COLORS[t.coin], fontWeight: 600 }}>{t.coin}</td>
+                    <td style={{ padding: "4px 8px" }}>${fmt(t.price, t.coin === "BTC" ? 0 : 2)}</td>
+                    <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{t.qty?.toFixed(6)}</td>
+                    <td style={{ padding: "4px 8px" }}>${fmt(t.usdValue, 2)}</td>
+                    <td style={{ padding: "4px 8px", color: t.pnl == null ? "var(--color-text-tertiary)" : t.pnl >= 0 ? "#10b981" : "#ef4444", fontWeight: t.pnl != null ? 600 : 400 }}>
+                      {t.pnl == null ? "—" : `${t.pnl >= 0 ? "+" : ""}$${Math.abs(t.pnl).toFixed(2)}`}
+                    </td>
+                    <td style={{ padding: "4px 8px", color: "var(--color-text-tertiary)" }}>
+                      {t.fees != null ? `$${t.fees.toFixed(4)}` : "—"}
+                    </td>
+                    <td style={{ padding: "4px 8px", color: "var(--color-text-tertiary)", fontSize: 10 }}>
+                      {t.exitReason ? t.exitReason.replace(/_/g, " ").toLowerCase() : "—"}
+                    </td>
+                    <td style={{ padding: "4px 8px", fontSize: 10 }}>
+                      {t.lstmTrend != null ? (
+                        <span style={{ color: parseFloat(t.lstmTrend) > 0.1 ? "#10b981" : parseFloat(t.lstmTrend) < -0.1 ? "#ef4444" : "#94a3b8" }}>
+                          {parseFloat(t.lstmChange) >= 0 ? "+" : ""}{t.lstmChange}%
+                        </span>
+                      ) : "—"}
+                    </td>
+                    <td style={{ padding: "4px 8px", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--color-text-secondary)", fontSize: 10 }}
+                      title={t.agentReason || ""}>
+                      {t.agentReason ? t.agentReason.slice(0, 40) + (t.agentReason.length > 40 ? "..." : "") : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {txLog.length > 15 && (
+            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 6, textAlign: "right" }}>
+              Showing 15 of {txLog.length} — export CSV for full log
+            </div>
+          )}
         </div>
       )}
 
