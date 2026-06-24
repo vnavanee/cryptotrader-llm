@@ -218,6 +218,64 @@ function calcATR(prices, period = 14) {
   return trueRanges.reduce((a, b) => a + b, 0) / period;
 }
 
+// ─── Mean Reversion Signal ───────────────────────────────────────────────────
+// Generates BUY when price is oversold/below bands, SELL when overbought/above bands
+// Opposite of momentum — buys dips and sells rips in ranging markets
+function generateMeanReversionSignal(indicators, volumeRatio, feePercent) {
+  const signals = [];
+  const w = (weight, vote, label) => signals.push({ weight, vote, label });
+  const roundTrip = (parseFloat(feePercent) || 0.1) * 2;
+
+  // RSI extreme reversal (stronger thresholds than momentum)
+  if (indicators.rsi != null) {
+    if (indicators.rsi < 25)       w(3, 1,  `RSI deeply oversold (${indicators.rsi.toFixed(1)}) — strong mean reversion buy`);
+    else if (indicators.rsi < 35)  w(2, 1,  `RSI oversold (${indicators.rsi.toFixed(1)})`);
+    else if (indicators.rsi > 75)  w(3, -1, `RSI deeply overbought (${indicators.rsi.toFixed(1)}) — strong mean reversion sell`);
+    else if (indicators.rsi > 65)  w(2, -1, `RSI overbought (${indicators.rsi.toFixed(1)})`);
+    else                           w(1, 0,  `RSI neutral (${indicators.rsi.toFixed(1)})`);
+  }
+
+  // Bollinger Band breach — core of mean reversion
+  if (indicators.boll && indicators.currentPrice) {
+    const p    = indicators.currentPrice;
+    const pctB = indicators.boll.upper > indicators.boll.lower
+      ? (p - indicators.boll.lower) / (indicators.boll.upper - indicators.boll.lower)
+      : 0.5;
+    if (pctB < 0)         w(3, 1,  `Price BELOW lower BB band (${pctB.toFixed(2)}) — mean reversion buy`);
+    else if (pctB < 0.2)  w(2, 1,  `Price near lower BB (${pctB.toFixed(2)})`);
+    else if (pctB > 1)    w(3, -1, `Price ABOVE upper BB band (${pctB.toFixed(2)}) — mean reversion sell`);
+    else if (pctB > 0.8)  w(2, -1, `Price near upper BB (${pctB.toFixed(2)})`);
+    else                  w(1, 0,  `Price inside BB bands`);
+  }
+
+  // MACD reversal — mean reversion uses MACD crossing zero from extreme
+  if (indicators.macd != null) {
+    if (indicators.macd < -0.002)  w(1.5, 1,  `MACD deeply negative (${indicators.macd.toFixed(4)}) — expect reversion`);
+    else if (indicators.macd > 0.002) w(1.5, -1, `MACD deeply positive — expect reversion`);
+    else                              w(0.5, 0,  `MACD near zero`);
+  }
+
+  // Volume: mean reversion works better on low volume (no breakout)
+  if (volumeRatio < 0.8)  w(1.5, 1, `Low volume (${volumeRatio.toFixed(2)}x) — ranging market, MR favoured`);
+  else if (volumeRatio > 1.5) w(1, -0.5, `High volume — potential breakout, MR less reliable`);
+
+  const totalW   = signals.reduce((s, x) => s + x.weight, 0) || 1;
+  const weightedScore = signals.reduce((s, x) => s + x.weight * x.vote, 0) / totalW;
+  const agreeingBuy   = signals.filter(x => x.vote > 0).length;
+  const agreeingSell  = signals.filter(x => x.vote < 0).length;
+
+  const action = weightedScore > 0.3 ? "BUY" : weightedScore < -0.3 ? "SELL" : "HOLD";
+  const confidence = Math.min(99, Math.abs(weightedScore) * 100).toFixed(0);
+
+  return {
+    action, confidence, score: (weightedScore * 5).toFixed(2),
+    agreeingCount: action === "BUY" ? agreeingBuy : agreeingSell,
+    totalIndicators: signals.length,
+    reasons: signals,
+    mode: "mean_reversion",
+  };
+}
+
 function generateSignal(indicators, newsSentiment, volumeRatio, indicatorConfig = null) {
   const ic = indicatorConfig || {};
   const cfg = (key, defaults = {}) => ({ enabled: true, ...defaults, ...ic[key] });
@@ -1196,7 +1254,8 @@ function SettingsModal({ creds, onSave, onClose }) {
     agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
     agentIntervalSec:   creds.agentIntervalSec   || "30",
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
-    volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3" },
+    tradingMode:        creds.tradingMode        || "momentum",
+    volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3", minDirProb: "0.65" },
     minRrRatio:         creds.minRrRatio         || "3",
     sellOrderConfig: creds.sellOrderConfig || {
       type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
@@ -1557,6 +1616,33 @@ function SettingsModal({ creds, onSave, onClose }) {
               </div>
             </div>
 
+            {/* ── Trading mode ───────────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                Trading mode
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  Changes signal logic and DeepSeek instructions
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {[
+                  { value: "momentum",       icon: "📈", label: "Momentum",       desc: "Buy breakouts with strong indicator confluence. Best in trending markets. SMA crossovers and MACD are primary signals." },
+                  { value: "mean_reversion", icon: "↩️", label: "Mean Reversion", desc: "Buy dips below Bollinger bands, sell rips above. Best in ranging markets. RSI extremes and BB breaches are primary signals." },
+                ].map(m => (
+                  <div key={m.value} onClick={() => set("tradingMode", m.value)}
+                    style={{ padding: "12px 14px", borderRadius: 8, cursor: "pointer",
+                      border: `0.5px solid ${form.tradingMode === m.value ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: form.tradingMode === m.value ? "#6366f112" : "var(--color-background-secondary)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: form.tradingMode === m.value ? "#6366f1" : "var(--color-text-primary)", marginBottom: 4 }}>
+                      {m.icon} {m.label}
+                      {form.tradingMode === m.value && <span style={{ fontSize: 10, marginLeft: 8, background: "#6366f122", color: "#6366f1", padding: "1px 7px", borderRadius: 4 }}>ACTIVE</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.5 }}>{m.desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             {/* ── Volatility gate + R:R ratio ─────────────────────────────── */}
             <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
               <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: "var(--color-text-secondary)" }}>
@@ -1576,6 +1662,16 @@ function SettingsModal({ creds, onSave, onClose }) {
                     onChange={e => set("volatilityGate", { ...form.volatilityGate, minAtrPct: e.target.value })}
                     min="0" max="5" step="0.05" style={{ width: "100%", boxSizing: "border-box" }} />
                   <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>Must exceed fee × 1.5</div>
+                </label>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                    Min LSTM direction prob
+                    <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", display: "block" }}>0.5=coin flip 0.65=confident</span>
+                  </div>
+                  <input type="number" value={form.volatilityGate?.minDirProb || "0.65"}
+                    onChange={e => set("volatilityGate", { ...form.volatilityGate, minDirProb: e.target.value })}
+                    min="0.5" max="0.95" step="0.05" style={{ width: "100%", boxSizing: "border-box" }} />
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>{"P(up) over next "}{LSTM_STEPS}{"ticks"}</div>
                 </label>
                 <label style={{ fontSize: 12 }}>
                   <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min reward:risk ratio</div>
@@ -1881,13 +1977,15 @@ function SettingsModal({ creds, onSave, onClose }) {
 // Outputs: [predictedChangePct, trendScore(-1 to 1), volatilityScore(0 to 1)]
 
 const LSTM_SEQ_LEN     = 60;   // lookback window (ticks)
-const LSTM_FEATURES    = 6;    // input features per timestep
+const LSTM_STEPS       = 5;    // predict N ticks ahead (Priority 2: multi-step)
+const LSTM_FEATURES    = 7;    // input features: 6 original + time-of-day
 const LSTM_RETRAIN_MS  = 5 * 60 * 1000; // retrain every 5 minutes
 
 // Per-coin LSTM state
 const lstmModels    = {};  // { BTC: tf.Model, ... }
 const lstmLastTrain = {};  // { BTC: timestamp, ... }
 const lstmPredCache = {};  // { BTC: { predictedChangePct, trendScore, volatility, trainedAt } }
+const lstmTraining  = {};  // { BTC: bool } — per-coin training lock prevents concurrent fit() calls
 
 // Build feature vector for one timestep
 function buildLSTMFeatures(prices, i, indicators) {
@@ -1895,13 +1993,21 @@ function buildLSTMFeatures(prices, i, indicators) {
   const prev   = prices[Math.max(0, i - 1)] || price;
   const mean   = prices.slice(Math.max(0, i - 20), i + 1).reduce((a, b) => a + b, 0) / Math.min(i + 1, 20);
   const std    = Math.sqrt(prices.slice(Math.max(0, i - 20), i + 1).reduce((a, b) => a + (b - mean) ** 2, 0) / Math.min(i + 1, 20)) || 1;
+  // Time-of-day feature: encode hour as sine wave so midnight and noon are continuous
+  const hour = new Date().getHours();
+  const timeFeature = Math.sin(2 * Math.PI * hour / 24); // -1 to +1, periodic
   return [
-    (price - mean) / std,                                              // 0: z-score normalised price
-    ((indicators?.rsi ?? 50) - 50) / 50,                              // 1: RSI centred on 0
+    (price - mean) / std,                                                // 0: z-score price
+    ((indicators?.rsi ?? 50) - 50) / 50,                                // 1: RSI centred on 0
     Math.max(-1, Math.min(1, (indicators?.macd ?? 0) / (price * 0.01))), // 2: MACD normalised
-    indicators?.boll ? (price - indicators.boll.lower) / (indicators.boll.upper - indicators.boll.lower || 1) * 2 - 1 : 0, // 3: Bollinger %B
-    Math.min(2, Math.max(-2, (price - prev) / prev * 100)) / 2,      // 4: 1-tick return
-    indicators?.ema12 && indicators?.ema26 ? (indicators.ema12 - indicators.ema26) / price : 0, // 5: EMA ratio
+    indicators?.boll
+      ? (price - indicators.boll.lower) / (indicators.boll.upper - indicators.boll.lower || 1) * 2 - 1
+      : 0,                                                               // 3: Bollinger %B
+    Math.min(2, Math.max(-2, (price - prev) / prev * 100)) / 2,        // 4: 1-tick return
+    indicators?.ema12 && indicators?.ema26
+      ? (indicators.ema12 - indicators.ema26) / price
+      : 0,                                                               // 5: EMA ratio
+    timeFeature,                                                         // 6: time-of-day (sin encoded)
   ];
 }
 
@@ -1931,7 +2037,7 @@ async function createLSTMModel(_tf) {
   }));
   model.add(tf.layers.dropout({ rate: 0.1 }));
   model.add(tf.layers.dense({ units: 16, activation: "relu" }));
-  model.add(tf.layers.dense({ units: 3, activation: "tanh" }));
+  model.add(tf.layers.dense({ units: 4, activation: "tanh" })); // [changePct, trend, volatility, directionProb]
   model.compile({
     optimizer: tf.train.adam(0.001),
     loss: "meanSquaredError",
@@ -1942,6 +2048,12 @@ async function createLSTMModel(_tf) {
 // Train LSTM on historical price data
 async function trainLSTM(_tf, coin, prices, indicators) {
   const tf = window.tf;
+  // Guard against concurrent fit() calls on the same coin
+  if (lstmTraining[coin]) {
+    console.log(`[LSTM] ${coin}: skipping train — previous fit() still running`);
+    return lstmModels[coin] || null;
+  }
+  lstmTraining[coin] = true;
   if (prices.length < LSTM_SEQ_LEN + 20) return null; // need enough data
 
   const model = lstmModels[coin] || await createLSTMModel(tf);
@@ -1952,24 +2064,37 @@ async function trainLSTM(_tf, coin, prices, indicators) {
   const trainEnd = prices.length - 1;
   const trainStart = Math.max(LSTM_SEQ_LEN, trainEnd - 300); // use last 300 ticks
 
-  for (let i = trainStart; i < trainEnd; i++) {
+  // Need LSTM_STEPS extra ticks beyond trainEnd for multi-step targets
+  const safeEnd = prices.length - LSTM_STEPS;
+
+  for (let i = trainStart; i < safeEnd; i++) {
     const slice  = prices.slice(i - LSTM_SEQ_LEN, i);
     const seq    = [];
     for (let j = 0; j < LSTM_SEQ_LEN; j++) {
       seq.push(buildLSTMFeatures(slice, j, indicators));
     }
-    const future = prices[i];
-    const past   = prices[i - 1];
-    const changePct = Math.max(-1, Math.min(1, (future - past) / past * 100 / 2));
-    // Trend: positive if price is above 20-period SMA at this point
+
+    // Priority 2: predict LSTM_STEPS ticks ahead (5 ticks)
+    const priceNow    = prices[i - 1];
+    const priceFuture = prices[i + LSTM_STEPS - 1]; // 5 ticks ahead
+    const changePct   = Math.max(-1, Math.min(1, (priceFuture - priceNow) / priceNow * 100 / 2));
+
+    // Direction probability: fraction of next LSTM_STEPS ticks above current price
+    const futureSlice = prices.slice(i, i + LSTM_STEPS);
+    const upTicks = futureSlice.filter(p => p > priceNow).length;
+    const directionProb = (upTicks / LSTM_STEPS) * 2 - 1; // scale to -1..+1
+
+    // Trend: price relative to 20-SMA
     const sma20 = slice.slice(-20).reduce((a, b) => a + b, 0) / 20;
-    const trend = Math.max(-1, Math.min(1, (future - sma20) / sma20 * 50));
-    // Volatility: std of last 10 returns, normalised
-    const returns = slice.slice(-10).map((p, k) => k > 0 ? (p - slice[slice.length - 10 + k - 1]) / slice[slice.length - 10 + k - 1] : 0);
-    const volStd  = Math.sqrt(returns.reduce((a, b) => a + b * b, 0) / returns.length);
+    const trend = Math.max(-1, Math.min(1, (priceFuture - sma20) / sma20 * 50));
+
+    // Volatility: std of last 10 1-tick returns
+    const returns  = slice.slice(-10).map((p, k, arr) => k > 0 ? (p - arr[k - 1]) / arr[k - 1] : 0);
+    const volStd   = Math.sqrt(returns.reduce((a, b) => a + b * b, 0) / returns.length);
     const volatility = Math.min(1, volStd * 100);
+
     X.push(seq);
-    Y.push([changePct, trend, volatility]);
+    Y.push([changePct, trend, volatility, directionProb]); // 4 outputs now
   }
 
   if (X.length < 10) return null;
@@ -1979,15 +2104,26 @@ async function trainLSTM(_tf, coin, prices, indicators) {
 
   try {
     await model.fit(xTensor, yTensor, {
-      epochs: 15, batchSize: 32, validationSplit: 0.1, shuffle: true,
-      callbacks: { onEpochEnd: () => {} }, // silent
+      epochs: 10,           // reduced from 15 — faster, less overrun risk
+      batchSize: 16,        // smaller batches finish faster in browser
+      validationSplit: 0.1,
+      shuffle: true,
+      callbacks: {
+        onEpochEnd: (_epoch, logs) => {
+          // Early stop if loss is already very low
+          if (logs?.loss < 0.001) return model.stopTraining = true;
+        },
+      },
     });
+    return model;
+  } catch (e) {
+    console.error(`[LSTM] ${coin} fit() error:`, e.message);
+    return lstmModels[coin] || null; // return existing model if retrain fails
   } finally {
     xTensor.dispose();
     yTensor.dispose();
+    lstmTraining[coin] = false;  // always release lock
   }
-
-  return model;
 }
 
 // Run inference — get prediction for current state
@@ -2002,11 +2138,13 @@ async function runLSTMInference(_tf, coin, prices, indicators) {
   let pred;
   try {
     pred = model.predict(input);
-    const [changePct, trend, volatility] = Array.from(await pred.data());
+    const [changePct, trend, volatility, directionProb] = Array.from(await pred.data());
     return {
-      predictedChangePct: changePct * 2,    // un-scale: was normalised by /2
-      trendScore:         trend,             // -1 (bearish) to +1 (bullish)
-      volatility:         Math.abs(volatility), // 0 (calm) to 1 (volatile)
+      predictedChangePct: changePct * 2,          // 5-tick ahead change, un-scaled
+      trendScore:         trend,                   // -1 (bearish) to +1 (bullish)
+      volatility:         Math.abs(volatility),    // 0 (calm) to 1 (high)
+      directionProbability: (directionProb + 1) / 2, // rescale -1..1 → 0..1
+      lstmSteps:          LSTM_STEPS,              // how many ticks ahead
       trainedOn:          prices.length,
     };
   } finally {
@@ -2074,10 +2212,11 @@ Bollinger lower: $${indicators.boll?.lower?.toFixed(2) ?? "n/a"}
 ATR (14): $${indicators.atr?.toFixed(2) ?? "n/a"}
 
 LSTM RNN PREDICTION (trained on last ${indicators.trainedOn || "N/A"} ticks)
-${lstmPrediction ? `Predicted price change (next tick): ${lstmPrediction.predictedChangePct >= 0 ? "+" : ""}${lstmPrediction.predictedChangePct?.toFixed(3)}%
+${lstmPrediction ? `Predicted price change (next ${lstmPrediction.lstmSteps || 5} ticks): ${lstmPrediction.predictedChangePct >= 0 ? "+" : ""}${lstmPrediction.predictedChangePct?.toFixed(4)}%
+Direction probability (P↑ next ${lstmPrediction.lstmSteps || 5} ticks): ${((lstmPrediction.directionProbability ?? 0.5) * 100).toFixed(1)}% — STRONG BUY signal if >65%, STRONG SELL if <35%
 Trend score: ${lstmPrediction.trendScore?.toFixed(3)} (-1=strong bear, 0=neutral, +1=strong bull)
-Volatility: ${lstmPrediction.volatility?.toFixed(3)} (0=calm, 1=high volatility)
-LSTM trained on: ${lstmPrediction.trainedOn} price points` : "Not yet available (collecting price history — needs 80+ ticks)"}
+Volatility: ${lstmPrediction.volatility?.toFixed(3)} (0=calm, 1=high)
+LSTM trained on: ${lstmPrediction.trainedOn} price points` : "Not yet available (needs 80+ price ticks)"}
 
 CURRENT POSITION: ${positionStr}
 RECENT TRADES: ${historyStr}
@@ -2094,6 +2233,8 @@ Take profit target: ${settings.exitRules?.takeProfitValue}${settings.exitRules?.
 Stop loss limit: ${settings.exitRules?.stopLossValue}${settings.exitRules?.stopLossType==="percent"?"%":"$"}
 Reward:risk ratio: ${settings.exitRules ? (parseFloat(settings.exitRules.takeProfitValue||2)/parseFloat(settings.exitRules.stopLossValue||1)).toFixed(1) : "n/a"}:1
 Active exit strategies: ${Object.entries(exitStrategies||{}).filter(([,v])=>v?.enabled).map(([k])=>k).join(", ")||"none"}
+
+TRADING MODE: ${settings.tradingMode === "mean_reversion" ? "MEAN REVERSION — buy dips below bands, sell rips above bands. Low volume is preferred. MACD and RSI extremes are entry signals, not exit signals." : "MOMENTUM — buy breakouts with strong indicators, trend following."}
 
 DECISION CRITERIA — READ CAREFULLY:
 1. Only return BUY if the expected price move CLEARLY EXCEEDS the round-trip fee of ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}%. Small uncertain moves = HOLD.
@@ -2321,10 +2462,12 @@ function CryptoAlgoTrader() {
     cooldownMinutes: "1",
     agentMode: false,
     agentIntervalSec: "30",
+    tradingMode: "momentum",   // "momentum" | "mean_reversion"
     volatilityGate: {
-      enabled:       true,    // require minimum volatility before BUY
-      minVolatility: "0.3",   // LSTM volatility score must exceed this (0=calm, 1=high)
-      minAtrPct:     "0.3",   // ATR must be >= X% of price (ensures fee-profitable moves possible)
+      enabled:       true,
+      minVolatility: "0.3",   // LSTM volatility score must exceed this
+      minAtrPct:     "0.3",   // ATR must be >= X% of price
+      minDirProb:    "0.65",  // LSTM direction probability (0.5=coin flip, 0.65=confident bull)
     },
     minRrRatio:    "3",        // minimum reward:risk ratio — TP must be >= N × SL
     adaptiveSettings: {
@@ -2707,6 +2850,7 @@ function CryptoAlgoTrader() {
               minConfidence:   creds.minConfidence,
               indicatorConfig: creds.indicatorConfig,
               exitRules:       creds.exitRules?.[coin],
+              tradingMode:     creds.tradingMode || "momentum",
             },
             exitStrategies: creds.exitStrategies,
           });
@@ -3425,10 +3569,15 @@ function CryptoAlgoTrader() {
         macd:   calcMACD(cs.prices),
       };
 
-      // Use LLM agent decision if agentMode is on and a fresh decision exists
-      // Otherwise fall back to rule-based generateSignal
+      // Signal source priority:
+      // 1. LLM agent (DeepSeek) if agentMode is on and fresh decision available
+      // 2. Mean reversion signal generator if tradingMode === "mean_reversion"
+      // 3. Standard momentum signal generator (default)
       const agentDecision = creds.agentMode && agentDecisionRef.current?.[coin];
-      const signal = agentDecision || generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
+      const ruleSignal = creds.tradingMode === "mean_reversion"
+        ? generateMeanReversionSignal(indicators, volumeRatio, creds.feePercent)
+        : generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
+      const signal = agentDecision || ruleSignal;
 
       // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
@@ -3571,11 +3720,14 @@ function CryptoAlgoTrader() {
       // Only BUY when there is enough market movement to profit after fees
       const vgCfg     = creds.volatilityGate;
       const lstmVol   = lstmPredCache[coin]?.volatility ?? 1; // default to pass if no LSTM yet
+      const lstmDirProb = lstmPredCache[coin]?.directionProbability ?? 0.5; // 0..1, >0.65 = confident bull
       const atr       = calcATR(cs.prices, 14);
       const atrPct    = atr && newPrice ? (atr / newPrice * 100) : 999;
+      const minDirProb = parseFloat(vgCfg?.minDirProb || 0.65);
       const volGateOk = !vgCfg?.enabled || (
-        lstmVol  >= (parseFloat(vgCfg.minVolatility) || 0.3) &&
-        atrPct   >= (parseFloat(vgCfg.minAtrPct)     || 0.3)
+        lstmVol   >= (parseFloat(vgCfg.minVolatility) || 0.3) &&
+        atrPct    >= (parseFloat(vgCfg.minAtrPct)     || 0.3) &&
+        lstmDirProb >= minDirProb  // LSTM must be confident price goes up in 5 ticks
       );
 
       // ── Asymmetric TP/SL enforcement ─────────────────────────────────────────
@@ -3592,7 +3744,7 @@ function CryptoAlgoTrader() {
 
       // Log any failed gate conditions when signal says BUY (for transparency)
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
-        if (!volGateOk) addAutoLog(`[GATE] ${coin} BUY blocked — low volatility (LSTM vol:${lstmVol.toFixed(2)} ATR:${atrPct.toFixed(2)}% threshold:${vgCfg?.minAtrPct||0.3}%)`, "warn");
+        if (!volGateOk) addAutoLog(`[GATE] ${coin} BUY blocked — low vol/confidence (LSTM vol:${lstmVol.toFixed(2)} dirProb:${lstmDirProb.toFixed(2)} ATR:${atrPct.toFixed(2)}%)`, "warn");
         if (!rrOk)      addAutoLog(`[GATE] ${coin} BUY blocked — R:R ratio ${(tpVal/slVal).toFixed(1)}:1 < required ${minRr}:1 (adjust TP/SL in settings)`, "warn");
         if (!feeOk)     addAutoLog(`[GATE] ${coin} BUY blocked — ATR ${atrPct.toFixed(2)}% < 1.5× fee ${roundTripFee.toFixed(2)}% (move too small to profit)`, "warn");
       }
@@ -4369,9 +4521,12 @@ function CryptoAlgoTrader() {
               return (
                 <span key={coin} style={{ fontSize: 10, display: "flex", gap: 6, padding: "2px 8px", borderRadius: 5, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
                   <span style={{ color: COIN_COLORS[coin], fontWeight: 600 }}>{coin}</span>
-                  <span style={{ color: changeColor }}>{p.predictedChangePct >= 0 ? "+" : ""}{p.predictedChangePct?.toFixed(3)}%</span>
+                  <span style={{ color: changeColor }}>{p.predictedChangePct >= 0 ? "+" : ""}{p.predictedChangePct?.toFixed(3)}{"% ("}{LSTM_STEPS}{"t)"}</span>
                   <span style={{ color: p.trendScore > 0.1 ? "#10b981" : p.trendScore < -0.1 ? "#ef4444" : "#94a3b8" }}>
                     {p.trendScore > 0.1 ? "↑ bull" : p.trendScore < -0.1 ? "↓ bear" : "→ flat"}
+                  </span>
+                  <span style={{ color: (p.directionProbability ?? 0.5) >= 0.65 ? "#10b981" : "#94a3b8" }}>
+                    {"P↑:"}{((p.directionProbability ?? 0.5) * 100).toFixed(0)}{"%"}
                   </span>
                   <span style={{ color: "var(--color-text-tertiary)" }}>vol:{p.volatility?.toFixed(2)}</span>
                 </span>
@@ -4603,6 +4758,13 @@ function CryptoAlgoTrader() {
           <i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" />
           {running && autoEnabled ? "Live trading" : running ? "Simulating" : "Stopped"}
         </span>
+        {running && (
+          <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4,
+            background: creds.tradingMode === "mean_reversion" ? "#6366f122" : "#10b98122",
+            color:      creds.tradingMode === "mean_reversion" ? "#6366f1"   : "#10b981" }}>
+            {creds.tradingMode === "mean_reversion" ? "↩ Mean Reversion" : "📈 Momentum"}
+          </span>
+        )}
         <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
         {/* WebSocket status */}
         <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
