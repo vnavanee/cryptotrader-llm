@@ -1252,6 +1252,7 @@ function SettingsModal({ creds, onSave, onClose }) {
     },
     cooldownMinutes:   creds.cooldownMinutes   || "1",
     agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
+    signalSource:       creds.signalSource       || "rules",
     agentIntervalSec:   creds.agentIntervalSec   || "15",
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     tradingMode:        creds.tradingMode        || "momentum",
@@ -1614,6 +1615,51 @@ function SettingsModal({ creds, onSave, onClose }) {
                   );
                 })}
               </div>
+            </div>
+
+            {/* ── Signal source ──────────────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                Signal source
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  What drives BUY/SELL decisions
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                {[
+                  { value: "rules",    icon: "📐", label: "Rules",         desc: "RSI, MACD, SMA crossovers, Bollinger. Classic technical analysis. Always available." },
+                  { value: "rf",       icon: "🌲", label: "Random Forest",  desc: "ML classifier on 10 indicators. Available after 15 ticks. Fast and robust." },
+                  { value: "lstm",     icon: "🧠", label: "LSTM",           desc: "Sequence model predicting 5 ticks ahead. Available after 80 ticks. Better at patterns." },
+                  { value: "rf+lstm",  icon: "🔬", label: "RF + LSTM",      desc: "Average both models. More conservative — needs consensus to signal." },
+                  { value: "deepseek", icon: "🤖", label: "DeepSeek Agent", desc: "LLM reasoning over all signals. Most flexible. Requires Agent Mode ON and API key." },
+                ].map(s => (
+                  <div key={s.value} onClick={() => set("signalSource", s.value)}
+                    style={{ padding: "10px 12px", borderRadius: 8, cursor: "pointer", gridColumn: s.value === "deepseek" ? "span 2" : "span 1",
+                      border: `0.5px solid ${form.signalSource === s.value ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: form.signalSource === s.value ? "#6366f112" : "var(--color-background-secondary)" }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: form.signalSource === s.value ? "#6366f1" : "var(--color-text-primary)", marginBottom: 3 }}>
+                      {s.icon} {s.label}
+                      {form.signalSource === s.value && <span style={{ fontSize: 10, marginLeft: 8, background: "#6366f122", color: "#6366f1", padding: "1px 7px", borderRadius: 4 }}>ACTIVE</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", lineHeight: 1.4 }}>{s.desc}</div>
+                  </div>
+                ))}
+              </div>
+              {(form.signalSource === "rf" || form.signalSource === "rf+lstm") && (
+                <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#fef3c711", border: "0.5px solid #f59e0b", color: "#92400e" }}>
+                  RF uses current indicator snapshot — signals BUY when P(up) {">"} 58%, SELL when P(up) {"<"} 42%. Works immediately from tick 15.
+                </div>
+              )}
+              {(form.signalSource === "lstm" || form.signalSource === "rf+lstm") && (
+                <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#ede9fe11", border: "0.5px solid #8b5cf6", color: "#5b21b6" }}>
+                  LSTM needs 80+ ticks to warm up and retrains every 5 min. Uses both direction probability and trend score together.
+                </div>
+              )}
+              {form.signalSource === "deepseek" && !form.agentMode && (
+                <div style={{ marginTop: 8, fontSize: 10, padding: "6px 10px", borderRadius: 6, background: "#fee2e211", border: "0.5px solid #ef4444", color: "#991b1b" }}>
+                  Agent Mode must be ON for DeepSeek signals. Enable it below.
+                </div>
+              )}
             </div>
 
             {/* ── Trading mode ───────────────────────────────────────────── */}
@@ -2368,7 +2414,7 @@ ${lstmPrediction ? `LSTM (sequence model, ${lstmPrediction.lstmSteps || 5}-tick 
 ${rfPrediction ? `RANDOM FOREST (snapshot classifier, ${rfPrediction.trainedOn} samples):
   Direction P↑ next 5 ticks: ${((rfPrediction.directionProbability ?? 0.5) * 100).toFixed(1)}% — available from tick 15
   Consensus: ${rfPrediction.directionProbability > 0.6 ? "BULLISH" : rfPrediction.directionProbability < 0.4 ? "BEARISH" : "NEUTRAL"}` : "RF: warming up (needs 15 samples)"}
-${rfPrediction && lstmPrediction ? `MODEL CONSENSUS: RF=${((rfPrediction.directionProbability??0.5)*100).toFixed(0)}% LSTM=${((lstmPrediction.directionProbability??0.5)*100).toFixed(0)}% — ${rfPrediction.directionProbability > 0.55 && lstmPrediction.directionProbability > 0.55 ? "BOTH BULLISH → strong signal" : rfPrediction.directionProbability < 0.45 && lstmPrediction.directionProbability < 0.45 ? "BOTH BEARISH → strong signal" : "MODELS DISAGREE → treat with caution"}` : ""}
+${rfPrediction && lstmPrediction ? `MODEL CONSENSUS: RF=${((rfPrediction.directionProbability??0.5)*100).toFixed(0)}% LSTM=${((lstmPrediction.directionProbability??0.5)*100).toFixed(0)}% — ${rfPrediction.directionProbability > 0.55 && lstmPrediction.directionProbability > 0.55 ? "BOTH BULLISH" : rfPrediction.directionProbability < 0.45 && lstmPrediction.directionProbability < 0.45 ? "BOTH BEARISH" : `RF leans ${rfPrediction.directionProbability > 0.5 ? "bull" : "bear"}, LSTM leans ${lstmPrediction.directionProbability > 0.5 ? "bull" : "bear"}`}` : ""}
 
 CURRENT POSITION: ${positionStr}
 RECENT TRADES: ${historyStr}
@@ -2388,13 +2434,12 @@ Active exit strategies: ${Object.entries(exitStrategies||{}).filter(([,v])=>v?.e
 
 TRADING MODE: ${settings.tradingMode === "mean_reversion" ? "MEAN REVERSION — buy dips below bands, sell rips above bands. Low volume is preferred. MACD and RSI extremes are entry signals, not exit signals." : "MOMENTUM — buy breakouts with strong indicators, trend following."}
 
-DECISION CRITERIA — READ CAREFULLY:
-1. Only return BUY if the expected price move CLEARLY EXCEEDS the round-trip fee of ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}%. Small uncertain moves = HOLD.
-2. The LSTM volatility score must indicate sufficient movement is occurring. Low volatility = HOLD.
-3. Multiple indicators must AGREE — a lone RSI signal in a ranging market is noise, not signal.
-4. Return HOLD for any ambiguous situation. It is far better to miss a trade than lose to fees on a weak signal.
-5. Only return SELL if you have an open position AND indicators suggest reversal or target reached.
-6. Consider the reward:risk ratio — entering with TP < 3× SL is poor risk management.
+DECISION CRITERIA:
+1. The RF and LSTM models provide direction probability — weight these heavily. If both show >55% bullish, lean BUY.
+2. The expected move should exceed the round-trip fee of ${(parseFloat(settings.feePercent||0.1)*2).toFixed(3)}% — but if models are confident, a smaller expected move is acceptable.
+3. Be decisive — return BUY or SELL when evidence leans that way. Reserve HOLD for genuinely neutral situations.
+4. Only return SELL if there is an open position AND clear reversal evidence.
+5. Your job is to synthesise all signals into a clear decision, not to find reasons to stay out.
 
 Respond ONLY with valid JSON, no other text:
 {
@@ -2614,6 +2659,7 @@ function CryptoAlgoTrader() {
     cooldownMinutes: "1",
     agentMode: false,
     agentIntervalSec: "15",
+    signalSource: "rules",  // "rules" | "rf" | "lstm" | "rf+lstm" | "deepseek"
     tradingMode: "momentum",   // "momentum" | "mean_reversion"
     volatilityGate: {
       enabled:       true,
@@ -2957,7 +3003,8 @@ function CryptoAlgoTrader() {
   // When agentMode is on, calls Claude every N seconds for each enabled coin
   // and stores the decision in agentDecisionRef for runTick to consume
   useEffect(() => {
-    if (!creds.agentMode || !running) return;
+    const agentActive = creds.agentMode || creds.signalSource === "deepseek";
+    if (!agentActive || !running) return;
 
     const callAgent = async () => {
       for (const coin of creds.enabledCoins) {
@@ -3729,15 +3776,61 @@ function CryptoAlgoTrader() {
         try { updateRF(coin, cs.prices, indicators, volumeRatio); } catch (_) {}
       }
 
-      // Signal source priority:
-      // 1. LLM agent (DeepSeek) if agentMode is on and fresh decision available
-      // 2. Mean reversion signal generator if tradingMode === "mean_reversion"
-      // 3. Standard momentum signal generator (default)
-      const agentDecision = creds.agentMode && agentDecisionRef.current?.[coin];
+      // ── Signal source routing ─────────────────────────────────────────────────
+      // signalSource controls which model drives BUY/SELL decisions
+      const src = creds.signalSource || "rules";
+
+      // Rule-based fallback (always available)
       const ruleSignal = creds.tradingMode === "mean_reversion"
         ? generateMeanReversionSignal(indicators, volumeRatio, creds.feePercent)
         : generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
-      const signal = agentDecision || ruleSignal;
+
+      // DeepSeek agent decision (async, may be stale)
+      const agentDecision = (src === "deepseek") && agentDecisionRef.current?.[coin];
+
+      // RF signal: convert directionProbability → BUY/SELL/HOLD
+      const rfProb   = rfPredCache[coin]?.directionProbability ?? 0.5;
+      const rfSignal = (src === "rf" || src === "rf+lstm") && rfPredCache[coin] ? {
+        action:         rfProb > 0.58 ? "BUY" : rfProb < 0.42 ? "SELL" : "HOLD",
+        confidence:     String(Math.round(Math.abs(rfProb - 0.5) * 200)),
+        score:          String(((rfProb - 0.5) * 10).toFixed(2)),
+        reasons:        [{ label: `RF direction P↑: ${(rfProb*100).toFixed(1)}%`, vote: rfProb > 0.5 ? 1 : -1 }],
+        agreeingCount:  1, totalIndicators: 1, fromRF: true,
+      } : null;
+
+      // LSTM signal: use trendScore + directionProbability
+      const lstmCache  = lstmPredCache[coin];
+      const lstmProb   = lstmCache?.directionProbability ?? 0.5;
+      const lstmTrend  = lstmCache?.trendScore ?? 0;
+      const lstmAction = (lstmProb > 0.58 && lstmTrend > 0) ? "BUY"
+                       : (lstmProb < 0.42 && lstmTrend < 0) ? "SELL" : "HOLD";
+      const lstmSignal = (src === "lstm" || src === "rf+lstm") && lstmCache ? {
+        action:         lstmAction,
+        confidence:     String(Math.round(Math.abs(lstmProb - 0.5) * 200)),
+        score:          String(((lstmProb - 0.5) * 10).toFixed(2)),
+        reasons:        [{ label: `LSTM P↑:${(lstmProb*100).toFixed(1)}% trend:${lstmTrend.toFixed(2)}`, vote: lstmTrend > 0 ? 1 : -1 }],
+        agreeingCount:  1, totalIndicators: 1, fromLSTM: true,
+      } : null;
+
+      // RF+LSTM combined: both must agree, take average confidence
+      const combinedSignal = (src === "rf+lstm") && rfSignal && lstmSignal ? (() => {
+        const avgProb = (rfProb + lstmProb) / 2;
+        const action  = avgProb > 0.55 ? "BUY" : avgProb < 0.45 ? "SELL" : "HOLD";
+        return {
+          action,
+          confidence: String(Math.round(Math.abs(avgProb - 0.5) * 200)),
+          score:      String(((avgProb - 0.5) * 10).toFixed(2)),
+          reasons:    [{ label: `RF:${(rfProb*100).toFixed(0)}% LSTM:${(lstmProb*100).toFixed(0)}% avg:${(avgProb*100).toFixed(0)}%`, vote: action === "BUY" ? 1 : action === "SELL" ? -1 : 0 }],
+          agreeingCount: 2, totalIndicators: 2, fromRF: true, fromLSTM: true,
+        };
+      })() : null;
+
+      // Final signal: pick based on signalSource
+      const signal = agentDecision
+        || (src === "rf+lstm" && combinedSignal)
+        || (src === "rf"      && rfSignal)
+        || (src === "lstm"    && lstmSignal)
+        || ruleSignal;
 
       // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
@@ -3911,10 +4004,15 @@ function CryptoAlgoTrader() {
       const feeOk        = atrPct > roundTripFee; // just needs to exceed fee, not 1.5×
 
       // Log failed gates
+      // Log gate blocks only once per signal (throttle to avoid spam)
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
-        if (!volGateOk) addAutoLog(`[GATE] ${coin} blocked — vol gate ${volGateScore}/3 (vol:${volOk?'✓':'✗'} atr:${atrOk?'✓':'✗'} dir:${dirOk?'✓':'✗'} bestP:${bestDirProb.toFixed(2)})`, "warn");
-        if (!rrOk)      addAutoLog(`[GATE] ${coin} blocked — R:R ${(tpVal/slVal).toFixed(1)}:1 < min ${minRr}:1`, "warn");
-        if (!feeOk)     addAutoLog(`[GATE] ${coin} blocked — ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "warn");
+        const gateBlockKey = `${coin}-${Math.floor(Date.now()/10000)}`; // once per 10s per coin
+        if (!volGateOk && !window["_gateLog_"+gateBlockKey+"_v"]) {
+          window["_gateLog_"+gateBlockKey+"_v"] = true;
+          addAutoLog(`[GATE] ${coin} vol gate ${volGateScore}/3 (vol:${volOk?"✓":"✗"} atr:${atrOk?"✓":"✗"} dir:${dirOk?"✓":"✗"} P:${bestDirProb.toFixed(2)})`, "info");
+        }
+        if (!rrOk && !window["_gateLog_"+gateBlockKey+"_r"])   { window["_gateLog_"+gateBlockKey+"_r"]=true; addAutoLog(`[GATE] ${coin} R:R ${(tpVal/slVal).toFixed(1)}:1 < ${minRr}:1`, "info"); }
+        if (!feeOk && !window["_gateLog_"+gateBlockKey+"_f"])  { window["_gateLog_"+gateBlockKey+"_f"]=true; addAutoLog(`[GATE] ${coin} ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "info"); }
       }
 
       // BUY gate: signal + mandatory checks + soft gate (2-of-3)
@@ -4935,7 +5033,12 @@ function CryptoAlgoTrader() {
           <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4,
             background: creds.tradingMode === "mean_reversion" ? "#6366f122" : "#10b98122",
             color:      creds.tradingMode === "mean_reversion" ? "#6366f1"   : "#10b981" }}>
-            {creds.tradingMode === "mean_reversion" ? "↩ Mean Reversion" : "📈 Momentum"}
+            {creds.tradingMode === "mean_reversion" ? "↩ Mean Rev" : "📈 Momentum"}
+          </span>
+        )}
+        {running && (
+          <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4, background: "#6366f122", color: "#6366f1" }}>
+            {{ rules: "📐 Rules", rf: "🌲 RF", lstm: "🧠 LSTM", "rf+lstm": "🔬 RF+LSTM", deepseek: "🤖 DeepSeek" }[creds.signalSource || "rules"]}
           </span>
         )}
         <span style={{ color: statusColor }}><i className="ti ti-robot" aria-hidden="true" /> {statusLabel}</span>
