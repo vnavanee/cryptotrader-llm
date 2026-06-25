@@ -1252,7 +1252,7 @@ function SettingsModal({ creds, onSave, onClose }) {
     },
     cooldownMinutes:   creds.cooldownMinutes   || "1",
     agentMode:          creds.agentMode !== undefined ? creds.agentMode : false,
-    agentIntervalSec:   creds.agentIntervalSec   || "30",
+    agentIntervalSec:   creds.agentIntervalSec   || "15",
     adaptiveSettings:   creds.adaptiveSettings   || { enabled: false, maxTpDelta: "2", maxSlDelta: "1", requireHigh: "70", applyAfter: "3" },
     tradingMode:        creds.tradingMode        || "momentum",
     volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3", minDirProb: "0.65" },
@@ -1970,6 +1970,154 @@ function SettingsModal({ creds, onSave, onClose }) {
 }
 
 
+// ─── Random Forest Classifier ────────────────────────────────────────────────
+// Pure-JS in-browser RF — no TF.js needed, trains in < 100ms, works from tick 10
+// Predicts P(price up in next 5 ticks) from current indicator snapshot
+
+const RF_MIN_SAMPLES = 10;   // start predicting after just 10 labelled samples
+const RF_N_TREES     = 20;   // number of decision trees
+const RF_MAX_DEPTH   = 4;    // max tree depth (prevents overfitting on small datasets)
+const rfPredCache    = {};   // { BTC: { directionProbability, trainedOn } }
+const rfModels       = {};   // { BTC: forest }
+
+// Extract feature snapshot from current indicator state
+function buildRFFeatures(prices, indicators, volumeRatio) {
+  const p      = prices.at(-1) || 1;
+  const sma20  = calcSMA(prices, 20) || p;
+  const sma50  = calcSMA(prices, 50) || p;
+  const atr    = calcATR(prices, 14) || 0;
+  return [
+    ((indicators?.rsi ?? 50) - 50) / 50,                                // RSI normalised
+    Math.max(-1, Math.min(1, (indicators?.macd ?? 0) / (p * 0.01))),    // MACD normalised
+    indicators?.boll
+      ? Math.max(-1, Math.min(1, (p - indicators.boll.lower) /
+          (indicators.boll.upper - indicators.boll.lower || 1) * 2 - 1))
+      : 0,                                                               // Bollinger %B
+    sma20 > 0 ? (p - sma20) / sma20 : 0,                                // price vs SMA20
+    sma50 > 0 ? (p - sma50) / sma50 : 0,                                // price vs SMA50
+    indicators?.ema12 && indicators?.ema26
+      ? (indicators.ema12 - indicators.ema26) / p : 0,                  // EMA spread
+    atr / p,                                                             // ATR % of price
+    Math.max(-2, Math.min(2, volumeRatio - 1)),                          // volume ratio centred
+    prices.length > 1 ? (p - prices.at(-2)) / prices.at(-2) : 0,       // 1-tick return
+    prices.length > 5
+      ? (p - prices.at(-5)) / prices.at(-5) : 0,                       // 5-tick return
+  ];
+}
+
+// Build dataset: features at t → label (1 if up in 5 ticks, 0 if down)
+function buildRFDataset(prices, indicators, volumeRatio) {
+  const X = [], Y = [];
+  const minLen = RF_MIN_SAMPLES + 5;
+  if (prices.length < minLen) return { X, Y };
+  const end = prices.length - 5; // need 5 future ticks for labels
+  const start = Math.max(20, end - 300); // use last 300 points
+  for (let i = start; i < end; i++) {
+    const slice     = prices.slice(0, i + 1);
+    const indSnap   = {
+      rsi:  calcRSI(slice, 14),
+      macd: calcMACD(slice),
+      boll: calcBollinger(slice, 20),
+      ema12: calcEMA(slice, 12),
+      ema26: calcEMA(slice, 26),
+    };
+    const feats = buildRFFeatures(slice, indSnap, volumeRatio);
+    const label = prices[i + 5] > prices[i] ? 1 : 0; // up in 5 ticks?
+    X.push(feats); Y.push(label);
+  }
+  return { X, Y };
+}
+
+// Single decision tree node
+function buildTree(X, Y, depth, maxDepth, nFeatures) {
+  const n = Y.length;
+  if (n === 0) return { leaf: true, prob: 0.5 };
+  const pos = Y.filter(y => y === 1).length;
+  const prob = pos / n;
+  if (depth >= maxDepth || n < 4 || pos === 0 || pos === n) return { leaf: true, prob };
+
+  // Random feature subset (sqrt of total)
+  const allFeat = Array.from({ length: X[0].length }, (_, i) => i);
+  const featIdx = allFeat.sort(() => Math.random() - 0.5).slice(0, nFeatures);
+
+  let bestGini = Infinity, bestFeat = -1, bestThresh = 0;
+  for (const fi of featIdx) {
+    const vals = [...new Set(X.map(x => x[fi]))].sort((a, b) => a - b);
+    for (let v = 0; v < vals.length - 1; v++) {
+      const thresh = (vals[v] + vals[v + 1]) / 2;
+      const left   = Y.filter((_, i) => X[i][fi] <= thresh);
+      const right  = Y.filter((_, i) => X[i][fi] >  thresh);
+      if (!left.length || !right.length) continue;
+      const giniL  = 1 - Math.pow(left.filter(y=>y===1).length/left.length,2)
+                       - Math.pow(left.filter(y=>y===0).length/left.length,2);
+      const giniR  = 1 - Math.pow(right.filter(y=>y===1).length/right.length,2)
+                       - Math.pow(right.filter(y=>y===0).length/right.length,2);
+      const gini   = (left.length * giniL + right.length * giniR) / n;
+      if (gini < bestGini) { bestGini = gini; bestFeat = fi; bestThresh = thresh; }
+    }
+  }
+  if (bestFeat < 0) return { leaf: true, prob };
+  const leftIdx  = X.map((x, i) => i).filter(i => X[i][bestFeat] <= bestThresh);
+  const rightIdx = X.map((x, i) => i).filter(i => X[i][bestFeat] >  bestThresh);
+  return {
+    feat: bestFeat, thresh: bestThresh,
+    left:  buildTree(leftIdx.map(i=>X[i]),  leftIdx.map(i=>Y[i]),  depth+1, maxDepth, nFeatures),
+    right: buildTree(rightIdx.map(i=>X[i]), rightIdx.map(i=>Y[i]), depth+1, maxDepth, nFeatures),
+  };
+}
+
+function predictTree(node, x) {
+  if (node.leaf) return node.prob;
+  return x[node.feat] <= node.thresh ? predictTree(node.left, x) : predictTree(node.right, x);
+}
+
+// Bootstrap sample for bagging
+function bootstrap(X, Y) {
+  const n = X.length, bX = [], bY = [];
+  for (let i = 0; i < n; i++) {
+    const idx = Math.floor(Math.random() * n);
+    bX.push(X[idx]); bY.push(Y[idx]);
+  }
+  return { bX, bY };
+}
+
+// Train Random Forest
+function trainRF(X, Y) {
+  const nFeat = Math.max(2, Math.floor(Math.sqrt(X[0].length)));
+  const trees = [];
+  for (let t = 0; t < RF_N_TREES; t++) {
+    const { bX, bY } = bootstrap(X, Y);
+    trees.push(buildTree(bX, bY, 0, RF_MAX_DEPTH, nFeat));
+  }
+  return trees;
+}
+
+// RF inference — average tree probabilities
+function predictRF(trees, x) {
+  if (!trees?.length) return 0.5;
+  return trees.reduce((s, t) => s + predictTree(t, x), 0) / trees.length;
+}
+
+// Main RF update — train and predict
+function updateRF(coin, prices, indicators, volumeRatio) {
+  const { X, Y } = buildRFDataset(prices, indicators, volumeRatio);
+  if (X.length < RF_MIN_SAMPLES) return null;
+
+  // Retrain every 50 new samples or if no model yet
+  const lastCount = rfModels[coin]?.trainedOn || 0;
+  if (!rfModels[coin]?.trees || X.length - lastCount >= 50) {
+    const trees = trainRF(X, Y);
+    rfModels[coin] = { trees, trainedOn: X.length };
+    console.log(`[RF] ${coin}: trained on ${X.length} samples`);
+  }
+
+  // Predict current state
+  const currentFeats = buildRFFeatures(prices, indicators, volumeRatio);
+  const prob = predictRF(rfModels[coin].trees, currentFeats);
+  rfPredCache[coin] = { directionProbability: prob, trainedOn: X.length, timestamp: Date.now() };
+  return rfPredCache[coin];
+}
+
 // ─── LSTM RNN Model ──────────────────────────────────────────────────────────
 // Browser-native LSTM using TensorFlow.js
 // Architecture: 60-step sequence → LSTM(64) → LSTM(32) → Dense(3)
@@ -2180,7 +2328,7 @@ async function getLSTMPrediction(_tf, coin, prices, indicators) {
 async function callLLMAgent(context) {
   const {
     coin, currentPrice, indicators, sentiment, volumeRatio,
-    position, recentHistory, settings, exitStrategies, lstmPrediction, atrPct,
+    position, recentHistory, settings, exitStrategies, lstmPrediction, rfPrediction, atrPct,
   } = context;
 
   const positionStr = position
@@ -2212,11 +2360,15 @@ Bollinger lower: $${indicators.boll?.lower?.toFixed(2) ?? "n/a"}
 ATR (14): $${indicators.atr?.toFixed(2) ?? "n/a"}
 
 LSTM RNN PREDICTION (trained on last ${indicators.trainedOn || "N/A"} ticks)
-${lstmPrediction ? `Predicted price change (next ${lstmPrediction.lstmSteps || 5} ticks): ${lstmPrediction.predictedChangePct >= 0 ? "+" : ""}${lstmPrediction.predictedChangePct?.toFixed(4)}%
-Direction probability (P↑ next ${lstmPrediction.lstmSteps || 5} ticks): ${((lstmPrediction.directionProbability ?? 0.5) * 100).toFixed(1)}% — STRONG BUY signal if >65%, STRONG SELL if <35%
-Trend score: ${lstmPrediction.trendScore?.toFixed(3)} (-1=strong bear, 0=neutral, +1=strong bull)
-Volatility: ${lstmPrediction.volatility?.toFixed(3)} (0=calm, 1=high)
-LSTM trained on: ${lstmPrediction.trainedOn} price points` : "Not yet available (needs 80+ price ticks)"}
+${lstmPrediction ? `LSTM (sequence model, ${lstmPrediction.lstmSteps || 5}-tick forecast):
+  Predicted change: ${lstmPrediction.predictedChangePct >= 0 ? "+" : ""}${lstmPrediction.predictedChangePct?.toFixed(4)}%
+  Direction P↑: ${((lstmPrediction.directionProbability ?? 0.5) * 100).toFixed(1)}% (>65% = bull, <35% = bear)
+  Trend score: ${lstmPrediction.trendScore?.toFixed(3)} | Volatility: ${lstmPrediction.volatility?.toFixed(3)}
+  Trained on: ${lstmPrediction.trainedOn} ticks` : "LSTM: not yet available (needs 80+ ticks)"}
+${rfPrediction ? `RANDOM FOREST (snapshot classifier, ${rfPrediction.trainedOn} samples):
+  Direction P↑ next 5 ticks: ${((rfPrediction.directionProbability ?? 0.5) * 100).toFixed(1)}% — available from tick 15
+  Consensus: ${rfPrediction.directionProbability > 0.6 ? "BULLISH" : rfPrediction.directionProbability < 0.4 ? "BEARISH" : "NEUTRAL"}` : "RF: warming up (needs 15 samples)"}
+${rfPrediction && lstmPrediction ? `MODEL CONSENSUS: RF=${((rfPrediction.directionProbability??0.5)*100).toFixed(0)}% LSTM=${((lstmPrediction.directionProbability??0.5)*100).toFixed(0)}% — ${rfPrediction.directionProbability > 0.55 && lstmPrediction.directionProbability > 0.55 ? "BOTH BULLISH → strong signal" : rfPrediction.directionProbability < 0.45 && lstmPrediction.directionProbability < 0.45 ? "BOTH BEARISH → strong signal" : "MODELS DISAGREE → treat with caution"}` : ""}
 
 CURRENT POSITION: ${positionStr}
 RECENT TRADES: ${historyStr}
@@ -2461,7 +2613,7 @@ function CryptoAlgoTrader() {
     },
     cooldownMinutes: "1",
     agentMode: false,
-    agentIntervalSec: "30",
+    agentIntervalSec: "15",
     tradingMode: "momentum",   // "momentum" | "mean_reversion"
     volatilityGate: {
       enabled:       true,
@@ -2835,6 +2987,7 @@ function CryptoAlgoTrader() {
         try {
           const atr    = indicators.atr || calcATR(cs.prices, 14);
           const atrPct = atr && price ? (atr / price * 100) : null;
+          const rfPred = rfPredCache[coin] || null;
           const decision = await callLLMAgent({
             coin, currentPrice: price,
             indicators: { ...indicators, atr },
@@ -2844,6 +2997,7 @@ function CryptoAlgoTrader() {
             position:       cs.position,
             recentHistory:  cs.history?.slice(-5) || [],
             lstmPrediction: lstmPredCache[coin] || null,
+            rfPrediction:   rfPred,
             settings: {
               tradeSizeUSD:    creds.tradeSizeUSD,
               feePercent:      creds.feePercent,
@@ -2948,7 +3102,7 @@ function CryptoAlgoTrader() {
 
     // Call immediately then on interval
     callAgent();
-    const intervalMs = (parseFloat(creds.agentIntervalSec) || 30) * 1000;
+    const intervalMs = (parseFloat(creds.agentIntervalSec) || 15) * 1000;
     const id = setInterval(callAgent, intervalMs);
     return () => clearInterval(id);
   }, [creds.agentMode, creds.agentIntervalSec, running, creds.enabledCoins.join(",")]);
@@ -3567,7 +3721,13 @@ function CryptoAlgoTrader() {
         rsi:    calcRSI(cs.prices, 14),
         boll:   calcBollinger(cs.prices, bollPeriod),
         macd:   calcMACD(cs.prices),
+        atr:    calcATR(cs.prices, 14),
       };
+
+      // RF classifier: sync, updates rfPredCache every tick (trains after 15 samples)
+      if (cs.prices.length >= RF_MIN_SAMPLES + 5) {
+        try { updateRF(coin, cs.prices, indicators, volumeRatio); } catch (_) {}
+      }
 
       // Signal source priority:
       // 1. LLM agent (DeepSeek) if agentMode is on and fresh decision available
@@ -3716,40 +3876,48 @@ function CryptoAlgoTrader() {
       const esV = creds.exitStrategies?.volumeGate;
       const volumeOk = !esV?.enabled || volumeRatio >= (parseFloat(esV.minVolumeRatio) || 1.2);
 
-      // ── Volatility gate (Priority 1) ─────────────────────────────────────────
-      // Only BUY when there is enough market movement to profit after fees
-      const vgCfg     = creds.volatilityGate;
-      const lstmVol   = lstmPredCache[coin]?.volatility ?? 1; // default to pass if no LSTM yet
-      const lstmDirProb = lstmPredCache[coin]?.directionProbability ?? 0.5; // 0..1, >0.65 = confident bull
-      const atr       = calcATR(cs.prices, 14);
-      const atrPct    = atr && newPrice ? (atr / newPrice * 100) : 999;
-      const minDirProb = parseFloat(vgCfg?.minDirProb || 0.65);
-      const volGateOk = !vgCfg?.enabled || (
-        lstmVol   >= (parseFloat(vgCfg.minVolatility) || 0.3) &&
-        atrPct    >= (parseFloat(vgCfg.minAtrPct)     || 0.3) &&
-        lstmDirProb >= minDirProb  // LSTM must be confident price goes up in 5 ticks
-      );
+      // ── Volatility gate ──────────────────────────────────────────────────────
+      const vgCfg       = creds.volatilityGate;
+      const lstmVol     = lstmPredCache[coin]?.volatility ?? 1;
+      const lstmPrices  = cs.prices.length;
+      // Adaptive directionProb threshold: relax when LSTM has little data
+      const minDirProbBase = parseFloat(vgCfg?.minDirProb || 0.55);
+      const minDirProb     = lstmPrices < 200 ? Math.max(0.52, minDirProbBase - 0.1) : minDirProbBase;
+      const lstmDirProb    = lstmPredCache[coin]?.directionProbability ?? 0.5;
+      const rfDirProb      = rfPredCache[coin]?.directionProbability   ?? 0.5;
+      // Use whichever predictor is more confident (RF warmup=10 ticks, LSTM=80 ticks)
+      const bestDirProb    = Math.max(lstmDirProb, rfDirProb);
+      const atr            = calcATR(cs.prices, 14);
+      const atrPct         = atr && newPrice ? (atr / newPrice * 100) : 999;
+
+      // Individual gate sub-conditions
+      const volOk  = !vgCfg?.enabled || lstmVol >= (parseFloat(vgCfg.minVolatility) || 0.3);
+      const atrOk  = !vgCfg?.enabled || atrPct  >= (parseFloat(vgCfg.minAtrPct)     || 0.3);
+      const dirOk  = !vgCfg?.enabled || bestDirProb >= minDirProb;
+
+      // OR-weighted: require at least 2 of 3 sub-conditions (not all 3)
+      const volGateScore = (volOk ? 1 : 0) + (atrOk ? 1 : 0) + (dirOk ? 1 : 0);
+      const volGateOk    = !vgCfg?.enabled || volGateScore >= 2;
 
       // ── Asymmetric TP/SL enforcement ─────────────────────────────────────────
-      // Ensure TP >= minRrRatio × SL so we only trade with favourable risk:reward
-      const minRr  = parseFloat(creds.minRrRatio) || 3;
+      const minRr  = parseFloat(creds.minRrRatio) || 2; // relaxed default: 2:1 not 3:1
       const er     = creds.exitRules?.[coin] || {};
       const tpVal  = parseFloat(er.takeProfitValue) || 2;
       const slVal  = parseFloat(er.stopLossValue)   || 1;
       const rrOk   = minRr <= 0 || (tpVal / slVal) >= minRr;
 
-      // Fee break-even check: ATR-derived expected move must exceed round-trip fee
+      // Fee break-even: require ATR > round-trip fee (relaxed from 1.5×)
       const roundTripFee = (parseFloat(creds.feePercent) || 0.1) * 2;
-      const feeOk = atrPct > roundTripFee * 1.5; // need 1.5× fee to be worth it
+      const feeOk        = atrPct > roundTripFee; // just needs to exceed fee, not 1.5×
 
-      // Log any failed gate conditions when signal says BUY (for transparency)
+      // Log failed gates
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
-        if (!volGateOk) addAutoLog(`[GATE] ${coin} BUY blocked — low vol/confidence (LSTM vol:${lstmVol.toFixed(2)} dirProb:${lstmDirProb.toFixed(2)} ATR:${atrPct.toFixed(2)}%)`, "warn");
-        if (!rrOk)      addAutoLog(`[GATE] ${coin} BUY blocked — R:R ratio ${(tpVal/slVal).toFixed(1)}:1 < required ${minRr}:1 (adjust TP/SL in settings)`, "warn");
-        if (!feeOk)     addAutoLog(`[GATE] ${coin} BUY blocked — ATR ${atrPct.toFixed(2)}% < 1.5× fee ${roundTripFee.toFixed(2)}% (move too small to profit)`, "warn");
+        if (!volGateOk) addAutoLog(`[GATE] ${coin} blocked — vol gate ${volGateScore}/3 (vol:${volOk?'✓':'✗'} atr:${atrOk?'✓':'✗'} dir:${dirOk?'✓':'✗'} bestP:${bestDirProb.toFixed(2)})`, "warn");
+        if (!rrOk)      addAutoLog(`[GATE] ${coin} blocked — R:R ${(tpVal/slVal).toFixed(1)}:1 < min ${minRr}:1`, "warn");
+        if (!feeOk)     addAutoLog(`[GATE] ${coin} blocked — ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "warn");
       }
 
-      // BUY gate: ALL conditions must pass
+      // BUY gate: signal + mandatory checks + soft gate (2-of-3)
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup &&
           noPending && !inCooldown && volumeOk && volGateOk && rrOk && feeOk) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
@@ -4515,20 +4683,25 @@ function CryptoAlgoTrader() {
               </span>
             </span>
             {creds.enabledCoins.map(coin => {
-              const p = lstmPred[coin];
-              if (!p) return <span key={coin} style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{coin}: collecting data...</span>;
-              const changeColor = p.predictedChangePct > 0 ? "#10b981" : p.predictedChangePct < 0 ? "#ef4444" : "#94a3b8";
+              const p   = lstmPred[coin];
+              const rf  = rfPredCache[coin];
+              const hasData = p || rf;
+              if (!hasData) return <span key={coin} style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{coin}: warming up...</span>;
+              const rfProb   = rf?.directionProbability ?? 0.5;
+              const lstmProb = p?.directionProbability  ?? 0.5;
+              const consensus = rfProb > 0.55 && lstmProb > 0.55 ? "bull"
+                : rfProb < 0.45 && lstmProb < 0.45 ? "bear" : "split";
               return (
-                <span key={coin} style={{ fontSize: 10, display: "flex", gap: 6, padding: "2px 8px", borderRadius: 5, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)" }}>
+                <span key={coin} style={{ fontSize: 10, display: "flex", gap: 5, padding: "3px 8px", borderRadius: 5,
+                  background: "var(--color-background-primary)",
+                  border: `0.5px solid ${consensus === "bull" ? "#10b981" : consensus === "bear" ? "#ef4444" : "var(--color-border-tertiary)"}` }}>
                   <span style={{ color: COIN_COLORS[coin], fontWeight: 600 }}>{coin}</span>
-                  <span style={{ color: changeColor }}>{p.predictedChangePct >= 0 ? "+" : ""}{p.predictedChangePct?.toFixed(3)}{"% ("}{LSTM_STEPS}{"t)"}</span>
-                  <span style={{ color: p.trendScore > 0.1 ? "#10b981" : p.trendScore < -0.1 ? "#ef4444" : "#94a3b8" }}>
-                    {p.trendScore > 0.1 ? "↑ bull" : p.trendScore < -0.1 ? "↓ bear" : "→ flat"}
+                  {rf && <span style={{ color: rfProb >= 0.55 ? "#10b981" : rfProb <= 0.45 ? "#ef4444" : "#94a3b8" }}>RF:{(rfProb*100).toFixed(0)}%</span>}
+                  {p  && <span style={{ color: lstmProb >= 0.55 ? "#10b981" : lstmProb <= 0.45 ? "#ef4444" : "#94a3b8" }}>LSTM:{(lstmProb*100).toFixed(0)}%</span>}
+                  <span style={{ fontWeight: 700, color: consensus === "bull" ? "#10b981" : consensus === "bear" ? "#ef4444" : "#94a3b8" }}>
+                    {consensus === "bull" ? "↑ bull" : consensus === "bear" ? "↓ bear" : "~ split"}
                   </span>
-                  <span style={{ color: (p.directionProbability ?? 0.5) >= 0.65 ? "#10b981" : "#94a3b8" }}>
-                    {"P↑:"}{((p.directionProbability ?? 0.5) * 100).toFixed(0)}{"%"}
-                  </span>
-                  <span style={{ color: "var(--color-text-tertiary)" }}>vol:{p.volatility?.toFixed(2)}</span>
+                  {p && <span style={{ color: "var(--color-text-tertiary)" }}>v:{p.volatility?.toFixed(2)}</span>}
                 </span>
               );
             })}
