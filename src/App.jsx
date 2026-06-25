@@ -1258,6 +1258,12 @@ function SettingsModal({ creds, onSave, onClose }) {
     tradingMode:        creds.tradingMode        || "momentum",
     volatilityGate:     creds.volatilityGate     || { enabled: true, minVolatility: "0.3", minAtrPct: "0.3", minDirProb: "0.65" },
     minRrRatio:         creds.minRrRatio         || "3",
+    postBuyLimitSell: creds.postBuyLimitSell || {
+      enabled: false, offsetType: "percent", offsetValue: "1.5",
+    },
+    buyOrderConfig: creds.buyOrderConfig || {
+      type: "market", limitOffsetType: "percent", limitOffsetValue: "0.05",
+    },
     sellOrderConfig: creds.sellOrderConfig || {
       type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
       stopPricePct: "0.5", limitPricePct: "0.6",
@@ -1289,6 +1295,8 @@ function SettingsModal({ creds, onSave, onClose }) {
   const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
   const setIndicator    = (key, patch) => set("indicatorConfig",  { ...form.indicatorConfig,  [key]: { ...form.indicatorConfig[key],  ...patch } });
   const setSellOrder    = (patch)       => set("sellOrderConfig",  { ...form.sellOrderConfig, ...patch });
+  const setBuyOrder         = (patch) => set("buyOrderConfig",    { ...form.buyOrderConfig,    ...patch });
+  const setPostBuyLimitSell = (patch) => set("postBuyLimitSell", { ...form.postBuyLimitSell, ...patch });
   const toggleSecret = (field) => setShowSecrets(s => ({ ...s, [field]: !s[field] }));
 
   const activeProviderInfo = EXCHANGE_PROVIDERS[form.provider];
@@ -1802,6 +1810,165 @@ function SettingsModal({ creds, onSave, onClose }) {
                         ))}
                       </div>
                     )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Buy order type ─────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
+                Buy order type
+                <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400, marginLeft: 8 }}>
+                  Limit BUY = maker order = lower or zero fees
+                </span>
+              </div>
+              {(() => {
+                const bc = form.buyOrderConfig;
+                return (
+                  <div>
+                    {/* Market vs Limit selector */}
+                    <div style={{ display: "flex", gap: 8, marginBottom: bc.type === "limit" ? 10 : 0 }}>
+                      {["market","limit"].map(t => (
+                        <div key={t} onClick={() => setBuyOrder({ type: t })}
+                          style={{ flex: 1, padding: "10px 14px", borderRadius: 8, cursor: "pointer",
+                            border: `0.5px solid ${bc.type === t ? "#10b981" : "var(--color-border-tertiary)"}`,
+                            background: bc.type === t ? "#d1fae508" : "var(--color-background-secondary)" }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: bc.type === t ? "#10b981" : "var(--color-text-primary)", marginBottom: 3 }}>
+                            {t === "market" ? "Market (taker)" : "Limit (maker)"}
+                            {bc.type === t && <span style={{ fontSize: 10, marginLeft: 8, background: "#10b98122", color: "#065f46", padding: "1px 7px", borderRadius: 4 }}>SELECTED</span>}
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                            {t === "market"
+                              ? "Fills instantly at best price. Taker fee applies (e.g. 0.1%)."
+                              : "Posts to order book. Fills when price reaches limit. Maker fee (often 0% on Binance.US)."}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {bc.type === "limit" && (
+                      <div style={{ padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid #10b98144" }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                          Limit price offset from signal price
+                        </div>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                          <label style={{ fontSize: 11 }}>
+                            <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>Offset type</div>
+                            <select value={bc.limitOffsetType} onChange={e => setBuyOrder({ limitOffsetType: e.target.value })}
+                              style={{ width: "100%", fontSize: 11, padding: "4px 6px", borderRadius: 4,
+                                border: "0.5px solid var(--color-border-secondary)",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                              <option value="percent">% offset</option>
+                              <option value="absolute">$ offset</option>
+                            </select>
+                          </label>
+                          <label style={{ fontSize: 11 }}>
+                            <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>
+                              Offset value
+                            </div>
+                            <input type="number" value={bc.limitOffsetValue} min="0" step={bc.limitOffsetType === "percent" ? "0.01" : "1"}
+                              onChange={e => setBuyOrder({ limitOffsetValue: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                          </label>
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--color-text-secondary)", lineHeight: 1.6, padding: "8px 10px", borderRadius: 6, background: "var(--color-background-primary)" }}>
+                          {bc.limitOffsetType === "percent" ? (
+                            <>
+                              <strong>Limit = signal price × (1 + {bc.limitOffsetValue || "0.05"}%)</strong>
+                              <br/>e.g. signal at $65,000 → limit at ${(65000 * (1 + parseFloat(bc.limitOffsetValue || 0.05) / 100)).toFixed(2)}
+                              <br/>Setting above current price means it fills quickly but counts as maker (posts to book then fills).
+                              <br/><span style={{ color: "#10b981" }}>Typical maker fee on Binance.US: 0% — saving {form.feePercent || "0.1"}% vs market order.</span>
+                            </>
+                          ) : (
+                            <>
+                              <strong>Limit = signal price + ${bc.limitOffsetValue || "0"}</strong>
+                              <br/>e.g. signal at $65,000 → limit at ${(65000 + parseFloat(bc.limitOffsetValue || 0)).toFixed(2)}
+                            </>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 8, padding: "6px 8px", borderRadius: 5, background: "#fef3c711", border: "0.5px solid #f59e0b" }}>
+                          If the limit order doesn't fill within 2 minutes, it will be cancelled. Lower offset = faster fill but may become taker. Higher offset = safer maker but slower fill.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* ── Post-buy limit sell ────────────────────────────────── */}
+            <div style={{ borderRadius: 10, border: `0.5px solid ${form.postBuyLimitSell?.enabled ? "#10b981" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.postBuyLimitSell?.enabled ? "#d1fae508" : "transparent" }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flex: 1 }}>
+                  <input type="checkbox" checked={!!form.postBuyLimitSell?.enabled}
+                    onChange={e => setPostBuyLimitSell({ enabled: e.target.checked })} />
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: form.postBuyLimitSell?.enabled ? "#10b981" : "var(--color-text-primary)" }}>
+                      Post-buy limit sell (auto profit target)
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 3, lineHeight: 1.5 }}>
+                      Immediately places a resting limit SELL on the exchange after a BUY fills.
+                      The sell order sits in the order book at your target price — qualifies as maker (0% fee on Binance.US).
+                    </div>
+                  </div>
+                </label>
+                <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, fontWeight: 700, flexShrink: 0,
+                  background: form.postBuyLimitSell?.enabled ? "#10b98122" : "var(--color-background-secondary)",
+                  color: form.postBuyLimitSell?.enabled ? "#065f46" : "var(--color-text-tertiary)" }}>
+                  {form.postBuyLimitSell?.enabled ? "ON" : "OFF"}
+                </span>
+              </div>
+              {form.postBuyLimitSell?.enabled && (
+                <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Offset type</div>
+                      <select value={form.postBuyLimitSell?.offsetType || "percent"}
+                        onChange={e => setPostBuyLimitSell({ offsetType: e.target.value })}
+                        style={{ width: "100%", fontSize: 12, padding: "5px 8px", borderRadius: 5,
+                          border: "0.5px solid var(--color-border-secondary)",
+                          background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                        <option value="percent">% above fill price</option>
+                        <option value="absolute">$ above fill price</option>
+                      </select>
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                        {form.postBuyLimitSell?.offsetType === "absolute" ? "Dollar offset ($)" : "Percent offset (%)"}
+                      </div>
+                      <input type="number" value={form.postBuyLimitSell?.offsetValue || "1.5"}
+                        min="0" step={form.postBuyLimitSell?.offsetType === "absolute" ? "1" : "0.1"}
+                        onChange={e => setPostBuyLimitSell({ offsetValue: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                    </label>
+                  </div>
+                  <div style={{ fontSize: 11, padding: "10px 12px", borderRadius: 7, background: "var(--color-background-primary)", lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
+                    {(() => {
+                      const off  = parseFloat(form.postBuyLimitSell?.offsetValue || 1.5);
+                      const isPct = form.postBuyLimitSell?.offsetType !== "absolute";
+                      const exBuy  = 65000;
+                      const exSell = isPct ? exBuy * (1 + off / 100) : exBuy + off;
+                      const exQty  = parseFloat(form.tradeSizeUSD || 50) / exBuy;
+                      const makerFee = 0; // Binance.US maker
+                      const takerFee = parseFloat(form.feePercent || 0.1) / 100;
+                      const profit = exQty * exSell * (1 - makerFee) - exQty * exBuy * (1 + takerFee);
+                      return (
+                        <>
+                          <strong>Example:</strong> BUY fills at $65,000 → limit SELL placed at ${exSell.toFixed(2)}
+                          {" ("}{isPct ? `+${off}%` : `+$${off}`}{")"}
+                          <br/>
+                          Est. profit: <strong style={{ color: profit > 0 ? "#10b981" : "#ef4444" }}>${profit.toFixed(4)}</strong>
+                          {" "}({isPct ? `${off}% move` : `$${off} move`}, taker buy + maker sell)
+                          <br/>
+                          <span style={{ color: "#10b981" }}>Maker sell = 0% fee → full profit retained on the sell side.</span>
+                          <br/>
+                          <span style={{ color: "var(--color-text-tertiary)", fontSize: 10 }}>
+                            If the limit sell doesn't fill before a stop-loss trigger, the algo cancels it and places a market sell.
+                          </span>
+                        </>
+                      );
+                    })()}
                   </div>
                 </div>
               )}
@@ -2675,6 +2842,20 @@ function CryptoAlgoTrader() {
       requireHigh:   "70",   // min agent confidence to apply adjustment
       applyAfter:    "3",    // apply only after N consistent suggestions
     },
+    postBuyLimitSell: {
+      enabled:          false,     // place a limit sell immediately after BUY fills
+      offsetType:       "percent", // "percent" | "absolute"
+      offsetValue:      "1.5",     // place limit sell X% or $X above fill price
+      // e.g. buy fills at $65,000 → limit sell at $65,975 (1.5% above)
+      // This is a maker sell order — 0% fee on Binance.US
+    },
+    buyOrderConfig: {
+      type:             "market",   // "market" | "limit"
+      limitOffsetType:  "percent",  // "percent" | "absolute"
+      limitOffsetValue: "0.05",     // place limit X% or $X ABOVE current price (maker)
+      // 0.05% above = fills quickly, qualifies as maker on most exchanges
+      // Higher = safer maker but slower fill
+    },
     sellOrderConfig: {
       type:               "market",   // market | limit | stop_limit | oco | trailing_stop
       limitOffsetType:    "percent",  // percent | absolute
@@ -3319,7 +3500,39 @@ function CryptoAlgoTrader() {
 
       if (!PROXY_BASE) throw new Error("No proxy URL — set PROXY_BASE to your Cloud Run function URL");
 
-      // For SELL orders — use advanced order type if configured
+      // ── BUY: limit order support (maker trades, lower fees) ─────────────────
+      const buyCfg         = creds.buyOrderConfig;
+      const useAdvancedBuy = action === "BUY" && buyCfg?.type === "limit";
+
+      if (useAdvancedBuy) {
+        addAutoLog(`⏳ [${providerName}] LIMIT BUY ${coin} @ signal $${price.toFixed(2)} + ${buyCfg.limitOffsetValue}${buyCfg.limitOffsetType === "percent" ? "%" : "$"} offset (maker)`, "info");
+        const buyRes = await fetch(`${PROXY_BASE}/advancedbuy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            exchange:     creds.provider,
+            coin,
+            quoteSize:    tradeUSD,
+            currentPrice: price,
+            buyConfig:    buyCfg,
+            ...keys,
+          }),
+        });
+        const buyData = await buyRes.json();
+        if (buyData.fallback) {
+          addAutoLog(`⚠ Limit BUY not supported on ${providerName} — using market`, "warn");
+          // Fall through to market BUY below
+        } else if (!buyRes.ok) {
+          throw new Error(buyData.error || `Limit BUY HTTP ${buyRes.status}`);
+        } else {
+          // Limit BUY placed — treat same as market pending (will poll for fill)
+          const limitPrice = buyData.limitPrice || price;
+          addAutoLog(`✓ LIMIT BUY ${coin} placed @ $${limitPrice.toFixed(2)} qty:${buyData.qty?.toFixed(8)} ID:${buyData.orderId?.slice(0,12)}... (maker order)`, "info");
+          return { success: true, orderId: buyData.orderId, fillPrice: limitPrice, filledQty: buyData.qty || baseSize };
+        }
+      }
+
+      // ── SELL: advanced order type ─────────────────────────────────────────────
       const sellCfg = creds.sellOrderConfig;
       const useAdvancedSell = action === "SELL" && sellCfg?.type && sellCfg.type !== "market";
 
@@ -4036,11 +4249,57 @@ function CryptoAlgoTrader() {
                 };
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
-                // Log BUY transaction
-                const fees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
-                logTransaction("BUY", coin, entryPrice, filledQty, null, fees, null,
-                  agentDecisionRef.current?.[coin]?.reasoning,
-                  lstmPredCache[coin]);
+                const buyFees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
+                logTransaction("BUY", coin, entryPrice, filledQty, null, buyFees, null,
+                  agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
+
+                // ── Post-buy limit sell ────────────────────────────────────────
+                // Place a resting limit SELL immediately after BUY fills
+                // This locks in profit target as a maker order (0% fee on Binance.US)
+                const pbls = creds.postBuyLimitSell;
+                if (pbls?.enabled && PROXY_BASE) {
+                  const off       = parseFloat(pbls.offsetValue) || 1.5;
+                  const limitSell = pbls.offsetType === "absolute"
+                    ? entryPrice + off
+                    : entryPrice * (1 + off / 100);
+                  const safeQty   = roundLotSize(filledQty * 0.9999, coin);
+                  addAutoLog(`📋 Placing limit SELL ${coin} @ $${limitSell.toFixed(2)} (+${off}${pbls.offsetType === "percent" ? "%" : "$"} from $${entryPrice.toFixed(2)})`, "info");
+                  fetch(`${PROXY_BASE}/advancedsell`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      exchange:    creds.provider,
+                      coin,
+                      qty:         safeQty,
+                      currentPrice: limitSell,
+                      sellConfig: {
+                        type:             "limit",
+                        limitOffsetType:  "absolute",
+                        limitOffsetValue: "0",  // price is already computed
+                      },
+                      _limitPriceOverride: limitSell, // proxy uses this directly
+                      ...creds.keys?.[creds.provider],
+                    }),
+                  })
+                  .then(r => r.json())
+                  .then(d => {
+                    if (d.orderId) {
+                      // Store the resting sell order ID so we can track or cancel it
+                      stateRef.current[coin].position = {
+                        ...stateRef.current[coin].position,
+                        restingSellOrderId:    d.orderId,
+                        restingSellLimitPrice: limitSell,
+                      };
+                      setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
+                      addAutoLog(`✓ Limit SELL ${coin} resting @ $${limitSell.toFixed(2)} — ID:${d.orderId?.slice(0,12)}... (maker)`, "success");
+                    } else if (d.fallback) {
+                      addAutoLog(`⚠ Limit SELL not supported on ${creds.provider} — manual exit required`, "warn");
+                    } else {
+                      addAutoLog(`⚠ Limit SELL ${coin} failed: ${d.error || "unknown error"}`, "error");
+                    }
+                  })
+                  .catch(e => addAutoLog(`⚠ Limit SELL ${coin} error: ${e.message}`, "error"));
+                }
               }
             })
             .finally(() => {
@@ -4606,6 +4865,13 @@ function CryptoAlgoTrader() {
                     </div>}
                   </>);
                 })()}
+                {/* Resting limit sell order (post-buy) */}
+                {coin.position?.restingSellLimitPrice && (
+                  <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2, fontWeight: 600 }}>
+                    <span>📋 Resting SELL</span>
+                    <strong>${fmt(coin.position.restingSellLimitPrice, 2)}</strong>
+                  </div>
+                )}
                 {tp && <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↑ TP</span><strong>${fmt(tp, 2)}</strong>
                 </div>}
@@ -4653,11 +4919,21 @@ function CryptoAlgoTrader() {
                     })()}</strong>
                   </div>
                 )}
-                {/* Active sell order type badge */}
-                {autoEnabled && creds.sellOrderConfig?.type && (
-                  <div style={{ fontSize: 10, marginTop: 4, color: "#6366f1", display: "flex", justifyContent: "space-between" }}>
-                    <span>Sell type</span>
-                    <strong style={{ textTransform: "uppercase" }}>{(creds.sellOrderConfig.type || "market").replace(/_/g," ")}</strong>
+                {/* Active order type badges */}
+                {autoEnabled && (
+                  <div style={{ fontSize: 10, marginTop: 4, display: "flex", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ color: "var(--color-text-tertiary)" }}>
+                      BUY: <strong style={{ color: creds.buyOrderConfig?.type === "limit" ? "#10b981" : "var(--color-text-secondary)" }}>
+                        {creds.buyOrderConfig?.type === "limit"
+                          ? `limit +${creds.buyOrderConfig.limitOffsetValue}${creds.buyOrderConfig.limitOffsetType === "percent" ? "%" : "$"}`
+                          : "market"}
+                      </strong>
+                    </span>
+                    <span style={{ color: "var(--color-text-tertiary)" }}>
+                      SELL: <strong style={{ color: "#6366f1" }}>
+                        {(creds.sellOrderConfig?.type || "market").replace(/_/g, " ")}
+                      </strong>
+                    </span>
                   </div>
                 )}
                 {creds.exitStrategies?.timeExit?.enabled && coin.position && (
