@@ -4205,16 +4205,15 @@ function CryptoAlgoTrader() {
       const volGateScore = (volOk ? 1 : 0) + (atrOk ? 1 : 0) + (dirOk ? 1 : 0);
       const volGateOk    = !vgCfg?.enabled || volGateScore >= 2;
 
-      // ── Asymmetric TP/SL enforcement ─────────────────────────────────────────
-      const minRr  = parseFloat(creds.minRrRatio) || 2; // relaxed default: 2:1 not 3:1
-      const er     = creds.exitRules?.[coin] || {};
-      const tpVal  = parseFloat(er.takeProfitValue) || 2;
-      const slVal  = parseFloat(er.stopLossValue)   || 1;
-      const rrOk   = minRr <= 0 || (tpVal / slVal) >= minRr;
-
-      // Fee break-even: require ATR > round-trip fee (relaxed from 1.5×)
+      // ── Asymmetric TP/SL + fee check — only enforced when volatility gate is ON ──
+      const minRr        = parseFloat(creds.minRrRatio) || 2;
+      const er           = creds.exitRules?.[coin] || {};
+      const tpVal        = parseFloat(er.takeProfitValue) || 2;
+      const slVal        = parseFloat(er.stopLossValue)   || 1;
       const roundTripFee = (parseFloat(creds.feePercent) || 0.1) * 2;
-      const feeOk        = atrPct > roundTripFee; // just needs to exceed fee, not 1.5×
+      // When volatility gate is OFF — skip R:R and fee checks entirely
+      const rrOk  = !vgCfg?.enabled || minRr <= 0 || (tpVal / slVal) >= minRr;
+      const feeOk = !vgCfg?.enabled || atrPct > roundTripFee;
 
       // Log failed gates
       // Log gate blocks only once per signal (throttle to avoid spam)
@@ -4224,8 +4223,8 @@ function CryptoAlgoTrader() {
           window["_gateLog_"+gateBlockKey+"_v"] = true;
           addAutoLog(`[GATE] ${coin} vol gate ${volGateScore}/3 (vol:${volOk?"✓":"✗"} atr:${atrOk?"✓":"✗"} dir:${dirOk?"✓":"✗"} P:${bestDirProb.toFixed(2)})`, "info");
         }
-        if (!rrOk && !window["_gateLog_"+gateBlockKey+"_r"])   { window["_gateLog_"+gateBlockKey+"_r"]=true; addAutoLog(`[GATE] ${coin} R:R ${(tpVal/slVal).toFixed(1)}:1 < ${minRr}:1`, "info"); }
-        if (!feeOk && !window["_gateLog_"+gateBlockKey+"_f"])  { window["_gateLog_"+gateBlockKey+"_f"]=true; addAutoLog(`[GATE] ${coin} ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "info"); }
+        if (vgCfg?.enabled && !rrOk  && !window["_gateLog_"+gateBlockKey+"_r"]) { window["_gateLog_"+gateBlockKey+"_r"]=true; addAutoLog(`[GATE] ${coin} R:R ${(tpVal/slVal).toFixed(1)}:1 < ${minRr}:1`, "info"); }
+        if (vgCfg?.enabled && !feeOk && !window["_gateLog_"+gateBlockKey+"_f"]) { window["_gateLog_"+gateBlockKey+"_f"]=true; addAutoLog(`[GATE] ${coin} ATR ${atrPct.toFixed(2)}% < fee ${roundTripFee.toFixed(2)}%`, "info"); }
       }
 
       // BUY gate: signal + mandatory checks + soft gate (2-of-3)
