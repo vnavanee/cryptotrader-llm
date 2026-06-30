@@ -1270,6 +1270,16 @@ function SettingsModal({ creds, onSave, onClose }) {
       ocoTpPct: "2", ocoSlPct: "1",
       trailStopDelta: "1.5", trailDeltaType: "percent",
     },
+    tickIntervalMs:   creds.tickIntervalMs   || 1500,
+    dynamicExits: creds.dynamicExits || {
+      enabled: false, mode: "aggressive_when_winning",
+      profitThreshold: "20", lossThreshold: "-20",
+      maxTpBoost: "50", maxTpCut: "50", maxSlTighten: "30",
+      scaleBy: "total",
+    },
+    indicatorPeriods: creds.indicatorPeriods || {
+      smaFast: 20, smaMid: 50, smaSlow: 99, emaFast: 12, emaSlow: 26, rsi: 14, bollinger: 20, atr: 14,
+    },
     indicatorConfig: creds.indicatorConfig || {
       rsi:       { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
       sma_20_50: { enabled: true,  weight: "1.5", fast: "20",      slow: "50"       },
@@ -1294,6 +1304,8 @@ function SettingsModal({ creds, onSave, onClose }) {
   const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
   const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
   const setIndicator    = (key, patch) => set("indicatorConfig",  { ...form.indicatorConfig,  [key]: { ...form.indicatorConfig[key],  ...patch } });
+  const setIndicatorPeriod = (key, value) => set("indicatorPeriods", { ...form.indicatorPeriods, [key]: parseInt(value) || 1 });
+  const setDynamicExits = (patch) => set("dynamicExits", { ...form.dynamicExits, ...patch });
   const setSellOrder    = (patch)       => set("sellOrderConfig",  { ...form.sellOrderConfig, ...patch });
   const setBuyOrder         = (patch) => set("buyOrderConfig",    { ...form.buyOrderConfig,    ...patch });
   const setPostBuyLimitSell = (patch) => set("postBuyLimitSell", { ...form.postBuyLimitSell, ...patch });
@@ -1897,6 +1909,117 @@ function SettingsModal({ creds, onSave, onClose }) {
               })()}
             </div>
 
+            {/* ── Dynamic exits based on cumulative P&L ─────────── */}
+            <div style={{ borderRadius: 10, border: `0.5px solid ${form.dynamicExits?.enabled ? "#f59e0b" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.dynamicExits?.enabled ? "#fef3c708" : "transparent" }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flex: 1 }}>
+                  <input type="checkbox" checked={!!form.dynamicExits?.enabled}
+                    onChange={e => setDynamicExits({ enabled: e.target.checked })} />
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: form.dynamicExits?.enabled ? "#f59e0b" : "var(--color-text-primary)" }}>
+                      {"\ud83d\udcca Dynamic exits (scale TP/SL by cumulative P&L)"}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 3, lineHeight: 1.5 }}>
+                      Widens TP when overall profit is strong. Tightens TP/SL when underwater to protect capital.
+                    </div>
+                  </div>
+                </label>
+                <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 5, fontWeight: 700, flexShrink: 0,
+                  background: form.dynamicExits?.enabled ? "#f59e0b22" : "var(--color-background-secondary)",
+                  color: form.dynamicExits?.enabled ? "#92400e" : "var(--color-text-tertiary)" }}>
+                  {form.dynamicExits?.enabled ? "ON" : "OFF"}
+                </span>
+              </div>
+              {form.dynamicExits?.enabled && (
+                <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                    {[
+                      { value: "aggressive_when_winning", label: "Aggressive when winning", desc: "Widen TP above profit threshold" },
+                      { value: "defensive_when_losing",   label: "Defensive when losing",   desc: "Tighten TP/SL below loss threshold" },
+                      { value: "both",                    label: "Both",                    desc: "Scale in both directions" },
+                    ].map(m => (
+                      <div key={m.value} onClick={() => setDynamicExits({ mode: m.value })}
+                        style={{ padding: "8px 10px", borderRadius: 7, cursor: "pointer",
+                          border: `0.5px solid ${form.dynamicExits?.mode === m.value ? "#f59e0b" : "var(--color-border-tertiary)"}`,
+                          background: form.dynamicExits?.mode === m.value ? "#f59e0b12" : "var(--color-background-secondary)" }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: form.dynamicExits?.mode === m.value ? "#92400e" : "var(--color-text-primary)" }}>{m.label}</div>
+                        <div style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginTop: 2 }}>{m.desc}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ color: "var(--color-text-secondary)" }}>Scale by:</span>
+                    <select value={form.dynamicExits?.scaleBy || "total"} onChange={e => setDynamicExits({ scaleBy: e.target.value })}
+                      style={{ fontSize: 12, padding: "4px 8px", borderRadius: 5, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                      <option value="total">Total P&L (all coins combined)</option>
+                      <option value="per_coin">Per-coin P&L (this coin only)</option>
+                    </select>
+                  </label>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "#10b981", marginBottom: 4, fontWeight: 600 }}>Profit threshold ($)</div>
+                      <input type="number" value={form.dynamicExits?.profitThreshold || "20"}
+                        onChange={e => setDynamicExits({ profitThreshold: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                      <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Start widening TP above this</div>
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "#ef4444", marginBottom: 4, fontWeight: 600 }}>Loss threshold ($)</div>
+                      <input type="number" value={form.dynamicExits?.lossThreshold || "-20"}
+                        onChange={e => setDynamicExits({ lossThreshold: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                      <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Start tightening below this (negative)</div>
+                    </label>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>Max TP boost (%)</div>
+                      <input type="number" value={form.dynamicExits?.maxTpBoost || "50"} min="0" max="200"
+                        onChange={e => setDynamicExits({ maxTpBoost: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>Max TP cut (%)</div>
+                      <input type="number" value={form.dynamicExits?.maxTpCut || "50"} min="0" max="90"
+                        onChange={e => setDynamicExits({ maxTpCut: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>Max SL tighten (%)</div>
+                      <input type="number" value={form.dynamicExits?.maxSlTighten || "30"} min="0" max="90"
+                        onChange={e => setDynamicExits({ maxSlTighten: e.target.value })}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                    </label>
+                  </div>
+                  <div style={{ fontSize: 11, padding: "10px 12px", borderRadius: 7, background: "var(--color-background-primary)", lineHeight: 1.7, color: "var(--color-text-secondary)" }}>
+                    {(() => {
+                      const pt = parseFloat(form.dynamicExits?.profitThreshold || 20);
+                      const lt = parseFloat(form.dynamicExits?.lossThreshold || -20);
+                      const baseTp = parseFloat(form.exitRules?.BTC?.takeProfitValue || 2);
+                      const baseSl = parseFloat(form.exitRules?.BTC?.stopLossValue || 1);
+                      const boostedTp = baseTp * (1 + parseFloat(form.dynamicExits?.maxTpBoost || 50) / 100);
+                      const cutTp     = baseTp * (1 - parseFloat(form.dynamicExits?.maxTpCut || 50) / 100);
+                      const tightSl   = baseSl * (1 - parseFloat(form.dynamicExits?.maxSlTighten || 30) / 100);
+                      return (
+                        <>
+                          <strong>{"Example with BTC base TP "}{baseTp}{"% / SL "}{baseSl}{"%:"}</strong>
+                          <br/>
+                          {"At $"}{pt}{"+ profit \u2192 TP widens up to "}<strong style={{ color: "#10b981" }}>{boostedTp.toFixed(2)}{"%"}</strong>
+                          <br/>
+                          {"At $"}{Math.abs(lt)}{"+ loss \u2192 TP tightens to "}<strong style={{ color: "#ef4444" }}>{cutTp.toFixed(2)}{"%"}</strong>
+                          {", SL tightens to "}<strong style={{ color: "#ef4444" }}>{tightSl.toFixed(2)}{"%"}</strong>
+                          <br/>
+                          <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                            {"Scaling is proportional between threshold and 2\u00d7 threshold, then capped at the max values above."}
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* ── Post-buy limit sell ────────────────────────────────── */}
             <div style={{ borderRadius: 10, border: `0.5px solid ${form.postBuyLimitSell?.enabled ? "#10b981" : "var(--color-border-tertiary)"}`, padding: "14px 16px", background: form.postBuyLimitSell?.enabled ? "#d1fae508" : "transparent" }}>
               <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
@@ -2108,6 +2231,77 @@ function SettingsModal({ creds, onSave, onClose }) {
                   </div>
                 );
               })()}
+            </div>
+
+            {/* ── Tick interval ──────────────────────────────────────────── */}
+            <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                Tick interval
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  How often the algo evaluates price and runs indicators
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
+                {[
+                  { ms: 500,   label: "0.5s" },
+                  { ms: 1000,  label: "1s" },
+                  { ms: 1500,  label: "1.5s" },
+                  { ms: 3000,  label: "3s" },
+                  { ms: 5000,  label: "5s" },
+                ].map(t => (
+                  <div key={t.ms} onClick={() => set("tickIntervalMs", t.ms)}
+                    style={{ padding: "8px", borderRadius: 7, cursor: "pointer", textAlign: "center",
+                      border: `0.5px solid ${form.tickIntervalMs === t.ms ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: form.tickIntervalMs === t.ms ? "#6366f112" : "var(--color-background-secondary)" }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: form.tickIntervalMs === t.ms ? "#6366f1" : "var(--color-text-primary)" }}>{t.label}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, padding: "8px 12px", borderRadius: 7, background: "var(--color-background-primary)", color: "var(--color-text-secondary)" }}>
+                Faster ticks (0.5s) react quicker but use more API calls / CPU. Slower ticks (5s) are gentler but less responsive.
+                This setting changes what a "20-tick SMA" means in real time — see below.
+              </div>
+            </div>
+
+            {/* ── Indicator periods (real-time configurable) ──────────────── */}
+            <div style={{ borderRadius: 10, border: "0.5px solid var(--color-border-tertiary)", padding: "14px 16px" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, color: "var(--color-text-secondary)" }}>
+                Indicator periods
+                <span style={{ fontSize: 10, fontWeight: 400, color: "var(--color-text-tertiary)", marginLeft: 8 }}>
+                  Number of ticks each indicator looks back — real-time span shown below each field
+                </span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                {[
+                  { key: "smaFast",   label: "SMA fast" },
+                  { key: "smaMid",    label: "SMA mid" },
+                  { key: "smaSlow",   label: "SMA slow" },
+                  { key: "emaFast",   label: "EMA fast" },
+                  { key: "emaSlow",   label: "EMA slow" },
+                  { key: "rsi",       label: "RSI" },
+                  { key: "bollinger", label: "Bollinger" },
+                  { key: "atr",       label: "ATR" },
+                ].map(({ key, label }) => {
+                  const periods = form.indicatorPeriods?.[key] || 14;
+                  const seconds = (periods * (form.tickIntervalMs || 1500)) / 1000;
+                  const timeLabel = seconds < 60 ? `${seconds.toFixed(0)}s`
+                    : seconds < 3600 ? `${(seconds / 60).toFixed(1)}m`
+                    : `${(seconds / 3600).toFixed(1)}h`;
+                  return (
+                    <label key={key} style={{ fontSize: 11 }}>
+                      <div style={{ color: "var(--color-text-secondary)", marginBottom: 4 }}>{label}</div>
+                      <input type="number" value={periods} min="2" max="500"
+                        onChange={e => setIndicatorPeriod(key, e.target.value)}
+                        style={{ width: "100%", boxSizing: "border-box" }} />
+                      <div style={{ fontSize: 10, color: "#6366f1", marginTop: 3, fontWeight: 600 }}>≈ {timeLabel}</div>
+                    </label>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 10, lineHeight: 1.6 }}>
+                Example: SMA fast = 20 ticks × {((form.tickIntervalMs || 1500)/1000).toFixed(1)}s tick = {((20 * (form.tickIntervalMs || 1500)) / 1000).toFixed(0)}s lookback.
+                Increase periods for longer-term trend detection, decrease for faster reaction to recent price action.
+              </div>
             </div>
 
             {/* ── Indicator configuration ─────────────────────────────── */}
@@ -2824,6 +3018,16 @@ function CryptoAlgoTrader() {
       signalReversal:  { enabled: true,  reversalScore:  "-2"  },
     },
     cooldownMinutes: "1",
+    dynamicExits: {
+      enabled:         false,  // scale TP/SL based on cumulative P&L
+      mode:            "aggressive_when_winning", // "aggressive_when_winning" | "defensive_when_losing" | "both"
+      profitThreshold: "20",   // $ — above this cumulative profit, widen TP
+      lossThreshold:   "-20",  // $ — below this cumulative loss, tighten TP / SL
+      maxTpBoost:      "50",   // % — max increase to TP when winning (e.g. +50% wider)
+      maxTpCut:        "50",   // % — max decrease to TP when losing (e.g. -50% tighter, faster exits)
+      maxSlTighten:    "30",   // % — max decrease to SL when losing (protect capital)
+      scaleBy:         "total", // "total" (all coins) | "per_coin" (this coin's P&L only)
+    },
     agentMode: false,
     agentIntervalSec: "15",
     signalSource: "rules",  // "rules" | "rf" | "lstm" | "rf+lstm" | "deepseek"
@@ -2867,6 +3071,17 @@ function CryptoAlgoTrader() {
       trailStopDelta:     "1.5",      // trailing stop % delta (exchange-native)
       trailDeltaType:     "percent",  // percent | absolute
     },
+    tickIntervalMs: 1500,  // how often runTick fires — controls real-time span of indicator periods
+    indicatorPeriods: {
+      smaFast:   20,   // ticks
+      smaMid:    50,
+      smaSlow:   99,
+      emaFast:   12,
+      emaSlow:   26,
+      rsi:       14,
+      bollinger: 20,
+      atr:       14,
+    },
     indicatorConfig: {
       rsi:            { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
       sma_20_50:      { enabled: true,  weight: "1.5", fast: "20",     slow: "50"  },
@@ -2878,6 +3093,14 @@ function CryptoAlgoTrader() {
       news:           { enabled: true,  weight: "1.5" },
     },
   });
+
+  // Sync tick speed with creds.tickIntervalMs whenever settings change
+  useEffect(() => {
+    if (creds.tickIntervalMs && creds.tickIntervalMs !== speed) {
+      setSpeed(creds.tickIntervalMs);
+    }
+  }, [creds.tickIntervalMs]);
+
   const [autoEnabled, setAutoEnabled] = useState(false);
   const [warmingUp, setWarmingUp]         = useState(false); // 5-min warmup after going live
   const [manualBuying, setManualBuying]   = useState(false); // per-coin buy in progress
@@ -2916,6 +3139,7 @@ function CryptoAlgoTrader() {
   // WebSocket price handler — writes directly to livePriceRef (same as HTTP poller)
   const handleWsPrice = useCallback((coin, price, bid, ask) => {
     if (!price || isNaN(price) || price <= 0) return;
+    // Store mid-price for display/signals; keep bid/ask for order placement
     livePriceRef.current[coin] = { price, bid: bid || price, ask: ask || price };
   }, []);
 
@@ -3193,18 +3417,19 @@ function CryptoAlgoTrader() {
         const price = livePriceRef.current[coin]?.price || cs.prices.at(-1);
         if (!price) continue;
 
-        const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
+        const ip = creds.indicatorPeriods || { smaFast:20, smaMid:50, smaSlow:99, emaFast:12, emaSlow:26, rsi:14, bollinger:20, atr:14 };
+        const bollPeriod = ip.bollinger;
         const indicators = {
           currentPrice: price,
-          sma20:  calcSMA(cs.prices, 20),
-          sma50:  calcSMA(cs.prices, 50),
-          sma99:  calcSMA(cs.prices, 99),
-          ema12:  calcEMA(cs.prices, 12),
-          ema26:  calcEMA(cs.prices, 26),
-          rsi:    calcRSI(cs.prices, 14),
-          boll:   calcBollinger(cs.prices, bollPeriod),
+          sma20:  calcSMA(cs.prices, ip.smaFast),
+          sma50:  calcSMA(cs.prices, ip.smaMid),
+          sma99:  calcSMA(cs.prices, ip.smaSlow),
+          ema12:  calcEMA(cs.prices, ip.emaFast),
+          ema26:  calcEMA(cs.prices, ip.emaSlow),
+          rsi:    calcRSI(cs.prices, ip.rsi),
+          boll:   calcBollinger(cs.prices, ip.bollinger),
           macd:   calcMACD(cs.prices),
-          atr:    calcATR(cs.prices, 14),
+          atr:    calcATR(cs.prices, ip.atr),
         };
 
         const volumes = cs.volumes;
@@ -3401,13 +3626,14 @@ function CryptoAlgoTrader() {
           console.log(`[LSTM] ${coin}: need ${LSTM_SEQ_LEN + 20} ticks, have ${cs.prices.length}`);
           continue;
         }
-        const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
+        const ip = creds.indicatorPeriods || { smaFast:20, smaMid:50, smaSlow:99, emaFast:12, emaSlow:26, rsi:14, bollinger:20, atr:14 };
+        const bollPeriod = ip.bollinger;
         const indicators = {
-          rsi:   calcRSI(cs.prices, 14),
+          rsi:   calcRSI(cs.prices, ip.rsi),
           macd:  calcMACD(cs.prices),
           boll:  calcBollinger(cs.prices, bollPeriod),
-          ema12: calcEMA(cs.prices, 12),
-          ema26: calcEMA(cs.prices, 26),
+          ema12: calcEMA(cs.prices, ip.emaFast),
+          ema26: calcEMA(cs.prices, ip.emaSlow),
         };
         try {
           setLstmStatus("training");
@@ -3970,18 +4196,19 @@ function CryptoAlgoTrader() {
       const avgVol = cs.volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(cs.volumes.length, 20);
       const volumeRatio = (cs.volumes[cs.volumes.length - 1] || 1) / avgVol;
 
-      const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
+      const ip = creds.indicatorPeriods || { smaFast:20, smaMid:50, smaSlow:99, emaFast:12, emaSlow:26, rsi:14, bollinger:20, atr:14 };
+      const bollPeriod = ip.bollinger;
       const indicators = {
         currentPrice: newPrice,
-        sma20:  calcSMA(cs.prices, 20),
-        sma50:  calcSMA(cs.prices, 50),
-        sma99:  calcSMA(cs.prices, 99),
-        ema12:  calcEMA(cs.prices, 12),
-        ema26:  calcEMA(cs.prices, 26),
-        rsi:    calcRSI(cs.prices, 14),
+        sma20:  calcSMA(cs.prices, ip.smaFast),
+        sma50:  calcSMA(cs.prices, ip.smaMid),
+        sma99:  calcSMA(cs.prices, ip.smaSlow),
+        ema12:  calcEMA(cs.prices, ip.emaFast),
+        ema26:  calcEMA(cs.prices, ip.emaSlow),
+        rsi:    calcRSI(cs.prices, ip.rsi),
         boll:   calcBollinger(cs.prices, bollPeriod),
         macd:   calcMACD(cs.prices),
-        atr:    calcATR(cs.prices, 14),
+        atr:    calcATR(cs.prices, ip.atr),
       };
 
       // RF classifier: sync, updates rfPredCache every tick (trains after 15 samples)
@@ -4050,12 +4277,50 @@ function CryptoAlgoTrader() {
       const es       = creds.exitStrategies || {};
       const entryPrice = cs.position?.price || newPrice;
 
+      // ── Dynamic TP/SL scaling based on cumulative P&L ────────────────────────
+      const dxCfg = creds.dynamicExits;
+      let tpMultiplier = 1, slMultiplier = 1, dxLabel = null;
+      if (dxCfg?.enabled) {
+        // Cumulative P&L source: total across all coins, or just this coin
+        const totalPnl = dxCfg.scaleBy === "per_coin"
+          ? cs.pnl
+          : COINS.reduce((sum, c) => sum + (s[c]?.pnl || 0), 0);
+
+        const profitThresh = parseFloat(dxCfg.profitThreshold) || 20;
+        const lossThresh   = parseFloat(dxCfg.lossThreshold)   || -20;
+        const maxTpBoost   = parseFloat(dxCfg.maxTpBoost)      || 50;  // %
+        const maxTpCut     = parseFloat(dxCfg.maxTpCut)        || 50;  // %
+        const maxSlTighten = parseFloat(dxCfg.maxSlTighten)    || 30;  // %
+
+        const allowWinning = dxCfg.mode === "aggressive_when_winning" || dxCfg.mode === "both";
+        const allowLosing  = dxCfg.mode === "defensive_when_losing"   || dxCfg.mode === "both";
+
+        if (allowWinning && totalPnl > profitThresh) {
+          // Scale boost proportionally: 2x threshold = full maxTpBoost, capped
+          const scaleFactor = Math.min(2, (totalPnl - profitThresh) / profitThresh + 1);
+          const boostPct = Math.min(maxTpBoost, maxTpBoost * (scaleFactor - 1));
+          tpMultiplier = 1 + boostPct / 100;
+          dxLabel = `+${boostPct.toFixed(0)}% TP (P&L $${totalPnl.toFixed(2)} > $${profitThresh})`;
+        } else if (allowLosing && totalPnl < lossThresh) {
+          // Tighten TP (faster exits) and SL (less room to lose) when underwater
+          const scaleFactor = Math.min(2, (Math.abs(totalPnl) - Math.abs(lossThresh)) / Math.abs(lossThresh) + 1);
+          const cutPct      = Math.min(maxTpCut,     maxTpCut     * (scaleFactor - 1));
+          const tightenPct  = Math.min(maxSlTighten, maxSlTighten * (scaleFactor - 1));
+          tpMultiplier = 1 - cutPct / 100;
+          slMultiplier = 1 - tightenPct / 100;
+          dxLabel = `-${cutPct.toFixed(0)}% TP, -${tightenPct.toFixed(0)}% SL (P&L $${totalPnl.toFixed(2)} < $${lossThresh})`;
+        }
+      }
+
       const resolveLevel = (type, value, direction) => {
         const v = parseFloat(value) || 0;
         if (!v) return null;
+        // Apply dynamic multiplier to the configured TP/SL distance
+        const mult = direction === "up" ? tpMultiplier : slMultiplier;
+        const scaledV = v * mult;
         return type === "percent"
-          ? direction === "up" ? entryPrice * (1 + v / 100) : entryPrice * (1 - v / 100)
-          : direction === "up" ? entryPrice + v : entryPrice - v;
+          ? direction === "up" ? entryPrice * (1 + scaledV / 100) : entryPrice * (1 - scaledV / 100)
+          : direction === "up" ? entryPrice + scaledV : entryPrice - scaledV;
       };
 
       // ── 1. Standard TP / SL ───────────────────────────────────────────────────
@@ -4251,6 +4516,7 @@ function CryptoAlgoTrader() {
                 const buyFees = filledQty * entryPrice * (parseFloat(creds.feePercent || 0) / 100);
                 logTransaction("BUY", coin, entryPrice, filledQty, null, buyFees, null,
                   agentDecisionRef.current?.[coin]?.reasoning, lstmPredCache[coin]);
+                if (dxLabel) addAutoLog(`📊 [DYNAMIC] ${coin} exits scaled: ${dxLabel}`, "info");
 
                 // ── Post-buy limit sell ────────────────────────────────────────
                 // Place a resting limit SELL immediately after BUY fills
@@ -4871,6 +5137,24 @@ function CryptoAlgoTrader() {
                     <strong>${fmt(coin.position.restingSellLimitPrice, 2)}</strong>
                   </div>
                 )}
+                {/* Dynamic exit scaling status */}
+                {creds.dynamicExits?.enabled && (() => {
+                  const totalPnl = creds.dynamicExits.scaleBy === "per_coin"
+                    ? coin.pnl
+                    : COINS.reduce((sum, c) => sum + (snapshot?.[c]?.pnl || 0), 0);
+                  const pt = parseFloat(creds.dynamicExits.profitThreshold) || 20;
+                  const lt = parseFloat(creds.dynamicExits.lossThreshold) || -20;
+                  const isWinning = totalPnl > pt;
+                  const isLosing  = totalPnl < lt;
+                  if (!isWinning && !isLosing) return null;
+                  return (
+                    <div style={{ fontSize: 10, marginBottom: 4, padding: "3px 8px", borderRadius: 5,
+                      background: isWinning ? "#10b98115" : "#ef444415",
+                      color: isWinning ? "#10b981" : "#ef4444", fontWeight: 600 }}>
+                      {"📊 "}{isWinning ? "Aggressive mode" : "Defensive mode"}{" (P&L: $"}{totalPnl.toFixed(2)}{")"}
+                    </div>
+                  );
+                })()}
                 {tp && <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↑ TP</span><strong>${fmt(tp, 2)}</strong>
                 </div>}
@@ -5299,7 +5583,7 @@ function CryptoAlgoTrader() {
 
       {/* ── Status bar ───────────────────────────────────────────────────────── */}
       <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", display: "flex", gap: 14, fontSize: 11, color: "var(--color-text-secondary)", flexWrap: "wrap", alignItems: "center" }}>
-        <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current}</span>
+        <span><i className="ti ti-clock" aria-hidden="true" /> Tick {tickRef.current} ({(creds.tickIntervalMs||1500)/1000}s)</span>
         <span style={{ color: running ? "#10b981" : "#ef4444" }}>
           <i className={`ti ${running ? "ti-circle-check" : "ti-circle-x"}`} aria-hidden="true" />
           {running && autoEnabled ? "Live trading" : running ? "Simulating" : "Stopped"}
